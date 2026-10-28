@@ -1,0 +1,5 @@
+sources:
+  arxiv_listing:
+    categories:
+      - cond-mat.mes-hall
+      - cond-mat.supr-con
