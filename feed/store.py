@@ -18,14 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from feed.schema import Paper, normalize_title
-
-
-class DailyManifest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    date: date
-    new: list[str] = Field(default_factory=list)
-    updated: list[str] = Field(default_factory=list)
+from feed.errors import SourceFailure
 
 
 class StoreConflict(BaseModel):
@@ -41,10 +34,17 @@ class StoreConflict(BaseModel):
     sources: list[str]
 
 
-class UpsertResult(DailyManifest):
-    """Daily changes plus conflicts encountered in this invocation only."""
+class DailyManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-    errors: list[StoreConflict] = Field(default_factory=list)
+    date: date
+    new: list[str] = Field(default_factory=list)
+    updated: list[str] = Field(default_factory=list)
+    errors: list[StoreConflict | SourceFailure] = Field(default_factory=list)
+
+
+class UpsertResult(DailyManifest):
+    """Cumulative daily changes, with errors from the current invocation."""
 
 
 class IdentifierConflict(ValueError):
@@ -186,7 +186,8 @@ class PaperStore:
                 papers[paper.paper_id] = paper
         return papers
 
-    def upsert(self, incoming: Iterable[Paper], *, day: date, write_daily: bool = True) -> UpsertResult:
+    def upsert(self, incoming: Iterable[Paper], *, day: date, write_daily: bool = True,
+               source_errors: Iterable[SourceFailure] = ()) -> UpsertResult:
         """Merge a batch and optionally accumulate a daily change manifest.
 
         Identifier upgrades count as updates. A paper first added today stays
@@ -203,14 +204,16 @@ class PaperStore:
         index = _PaperIndex(papers)
         origins = {key: {key} for key in papers}
         aliases = {}
-        errors = []
+        errors = list(source_errors)
         daily_path = self.root / "daily" / f"{day.isoformat()}.json"
         daily = DailyManifest.model_validate_json(daily_path.read_bytes()) if write_daily and daily_path.exists() else DailyManifest(date=day)
         if daily.date != day:
             raise ValueError("daily manifest date does not match its filename")
 
-        # Normalize batch order, including duplicate records, before any writes.
-        batch = sorted(incoming, key=lambda p: (p.first_seen, p.paper_id, p.last_updated, p.model_dump_json()))
+        # Resolve identified inputs before weak titles so ambiguity decisions
+        # see the same candidate set on the first run and on replay.
+        batch = sorted(incoming, key=lambda p: (p.paper_id.startswith("title:"), p.first_seen,
+                                                p.paper_id, p.last_updated, p.model_dump_json()))
         for paper in batch:
             matches = index.matches(paper)
             if paper.paper_id.startswith("title:"):
@@ -260,7 +263,11 @@ class PaperStore:
                 added.add(key)
             elif origins[key] != {key} or original.get(key) != paper:
                 updated.add(key)
-        daily = DailyManifest(date=day, new=sorted(added), updated=sorted(updated - added))
+        # Errors describe the latest attempt. Recovery clears stale failures;
+        # repeating the same failures is byte-identical instead of appending.
+        by_error = {error.model_dump_json(): error for error in errors}
+        daily = DailyManifest(date=day, new=sorted(added), updated=sorted(updated - added),
+                              errors=[by_error[key] for key in sorted(by_error)])
 
         shards = defaultdict(list)
         for paper in papers.values():
@@ -274,4 +281,4 @@ class PaperStore:
                 _write_if_changed(path, content)
         if write_daily:
             _write_if_changed(daily_path, _json(daily.model_dump(mode="json")))
-        return UpsertResult(**daily.model_dump(), errors=errors)
+        return UpsertResult(**daily.model_dump())

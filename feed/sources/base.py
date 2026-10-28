@@ -1,10 +1,11 @@
 """Source interface and registration; orchestration belongs to later PRs."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from feed.schema import Paper
+from feed.errors import SourceFailure
 
 
 class SourceError(RuntimeError):
@@ -15,6 +16,7 @@ class SourceError(RuntimeError):
 class SourceResult:
     announcement_dates: tuple[date, ...]
     papers: list[Paper]
+    errors: list[SourceFailure] = field(default_factory=list)
 
 
 class Source(ABC):

@@ -3,17 +3,16 @@
 import argparse
 import json
 import sys
+from contextlib import ExitStack
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import httpx
-import yaml
-from pydantic import ValidationError
-
 from feed.backfill import DEFAULT_END, DEFAULT_START, BackfillError, backfill
 from feed.config import load_config
-from feed.sources import SourceError, get_source
-from feed.store import PaperStore
+from feed.errors import SourceFailure
+from feed.ingest import ingest_sources
+from feed.sources import get_source
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,18 +37,20 @@ def main(argv: list[str] | None = None) -> int:
         print(result.model_dump_json())
         return 1 if result.errors else 0
     try:
-        config = load_config(args.config)
-        with httpx.Client(timeout=60, follow_redirects=True) as client:
-            source = get_source("arxiv_listing")(categories=config.sources.arxiv_listing.categories, client=client)
-            fetched = source.fetch(day=args.date, seen_at=datetime.now(timezone.utc))
-        reports = []
-        store = PaperStore(args.data_dir)
-        for announced in fetched.announcement_dates:
-            papers = [paper for paper in fetched.papers if paper.announced == announced]
-            result = store.upsert(papers, day=announced)
-            reports.append({"date": announced.isoformat(), "fetched": len(papers), "new": len(result.new),
-                            "updated": len(result.updated), "errors": [error.model_dump(mode="json") for error in result.errors]})
-    except (SourceError, ValidationError, yaml.YAMLError, OSError, ValueError):
+        seen_at = datetime.now(timezone.utc)
+        with ExitStack() as stack:
+            sources, setup_errors = {}, []
+            try:
+                config = load_config(args.config)
+                client = stack.enter_context(httpx.Client(timeout=60, follow_redirects=True))
+                sources["arxiv_listing"] = get_source("arxiv_listing")(
+                    categories=config.sources.arxiv_listing.categories, client=client)
+            except Exception:
+                setup_errors.append(SourceFailure(source="arxiv_listing", stage="source", announced=args.date,
+                                                  message="source initialization failed"))
+            reports = ingest_sources(sources, data_dir=args.data_dir, day=args.date,
+                                     seen_at=seen_at, source_errors=setup_errors)
+    except (OSError, ValueError):
         print("arxiv_listing ingest failed; storage or source/configuration is invalid", file=sys.stderr)
         return 1
     print(json.dumps(reports[0] if len(reports) == 1 else {"announcements": reports}, sort_keys=True))

@@ -20,6 +20,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from feed.schema import Paper
+from feed.errors import SourceFailure
 from feed.sources.base import Source, SourceError, SourceResult, register
 
 ListingType = Literal["new", "cross", "replacement"]
@@ -187,11 +188,17 @@ class ArxivListing(Source):
         refs: dict[str, ListingRef] = {}
         dates_by_id: dict[str, date] = {}
         announcement_dates = set()
+        errors = []
         for category in self.categories:
-            page = self._get(f"https://arxiv.org/list/{category}/new", {"show": 2000},
-                             lambda response: parse_listing(response.text))
-            if day is not None and day != page.announced:
-                raise SourceError("requested date does not match the current arXiv announcement")
+            try:
+                page = self._get(f"https://arxiv.org/list/{category}/new", {"show": 2000},
+                                 lambda response: parse_listing(response.text))
+                if day is not None and day != page.announced:
+                    raise SourceError("requested date does not match the current arXiv announcement")
+            except Exception:
+                errors.append(SourceFailure(source="arxiv_listing", stage="listing", category=category,
+                                            announced=day, message="arXiv listing fetch or validation failed"))
+                continue
             announcement_dates.add(page.announced)
             for ref in page.entries:
                 old = refs.get(ref.arxiv_id)
@@ -208,8 +215,15 @@ class ArxivListing(Source):
             identifiers = sorted(key for key in refs if dates_by_id[key] == announced)
             for start in range(0, len(identifiers), 100):
                 batch = {key: refs[key] for key in identifiers[start:start + 100]}
-                result.extend(self._get(
-                    API_URL, {"id_list": ",".join(ref.query_id for ref in batch.values()), "max_results": len(batch)},
-                    lambda response: parse_metadata(response.content, batch, announced=announced, seen_at=seen_at),
-                ))
-        return SourceResult(tuple(sorted(announcement_dates)), result)
+                try:
+                    result.extend(self._get(
+                        API_URL, {"id_list": ",".join(ref.query_id for ref in batch.values()), "max_results": len(batch)},
+                        lambda response: parse_metadata(response.content, batch, announced=announced, seen_at=seen_at),
+                    ))
+                except Exception:
+                    errors.append(SourceFailure(
+                        source="arxiv_listing", stage="metadata", announced=announced,
+                        paper_ids=[f"arxiv:{key}" for key in batch],
+                        message="arXiv metadata batch fetch or validation failed",
+                    ))
+        return SourceResult(tuple(sorted(announcement_dates)), result, errors)
