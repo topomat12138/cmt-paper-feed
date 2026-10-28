@@ -4,6 +4,7 @@ from datetime import date
 import pytest
 
 from feed.schema import Paper
+import feed.store as store_module
 from feed.store import PaperStore, merge_papers
 
 DAY = date(2026, 10, 28)
@@ -79,6 +80,47 @@ def test_stale_metadata_only_fills_gaps(paper):
     assert merged.arxiv_version == 3
 
 
+def test_first_seen_uses_earlier_value_in_either_merge_order(paper):
+    recent = paper()
+    historical = paper(first_seen="2026-04-11T01:30:00Z", last_updated="2026-04-11T01:30:00Z")
+    for existing, incoming in ((recent, historical), (historical, recent)):
+        merged = merge_papers(existing, incoming)
+        assert merged.first_seen == historical.first_seen
+        assert merged.last_updated == existing.last_updated
+
+
+@pytest.mark.parametrize("earlier", ["2026-04-11T01:30:00Z", "2025-12-31T23:30:00Z"])
+def test_historical_sighting_moves_shard_and_replays(tmp_path, paper, earlier):
+    store = PaperStore(tmp_path)
+    record = paper()
+    store.upsert([record], day=DAY)
+    original_daily = (tmp_path / "daily/2026-10-28.json").read_bytes()
+    historical = paper(first_seen=earlier, last_updated=earlier)
+    result = store.upsert([historical], day=NEXT)
+    assert result.new == []
+    assert result.updated == [record.paper_id]
+    assert result.errors == []
+    assert store.load()[record.paper_id].first_seen == historical.first_seen
+    assert not (tmp_path / "papers/2026/2026-10.jsonl").exists()
+    moved = tmp_path / "papers" / earlier[:4] / f"{earlier[:7]}.jsonl"
+    assert moved.is_file()
+    assert (tmp_path / "daily/2026-10-28.json").read_bytes() == original_daily
+    before = snapshot(tmp_path)
+    assert store.upsert([record, historical], day=NEXT) == result
+    assert snapshot(tmp_path) == before
+
+
+def test_historical_move_merges_into_existing_shard(tmp_path, paper):
+    store = PaperStore(tmp_path)
+    other = paper(arxiv_id="2604.10000", first_seen="2026-04-11T00:00:00Z")
+    store.upsert([paper(), other], day=DAY)
+    store.upsert([paper(first_seen="2026-04-12T00:00:00Z", last_updated=None)], day=NEXT)
+    path = tmp_path / "papers/2026/2026-04.jsonl"
+    ids = [json.loads(line)["paper_id"] for line in path.read_bytes().splitlines()]
+    assert ids == [other.paper_id, "arxiv:2610.33463"]
+    assert len(store.load()) == 2
+
+
 def test_observation_timestamps_alone_do_not_change_bytes(tmp_path, paper):
     store = PaperStore(tmp_path)
     store.upsert([paper()], day=DAY)
@@ -148,7 +190,10 @@ def test_jsonl_sorting_utf8_and_newlines(tmp_path, paper):
 def test_empty_batch_creates_empty_daily_and_replays(tmp_path):
     store = PaperStore(tmp_path)
     result = store.upsert([], day=DAY)
-    assert result.model_dump(mode="json") == {"date": "2026-10-28", "new": [], "updated": []}
+    assert result.model_dump(mode="json") == {"date": "2026-10-28", "new": [], "updated": [], "errors": []}
+    assert json.loads((tmp_path / "daily/2026-10-28.json").read_bytes()) == {
+        "date": "2026-10-28", "new": [], "updated": [],
+    }
     before = snapshot(tmp_path)
     store.upsert([], day=DAY)
     assert snapshot(tmp_path) == before
@@ -195,20 +240,103 @@ def test_promotion_collapses_existing_target_and_removes_empty_shard(tmp_path, p
 def test_distinct_identified_papers_with_same_title_are_not_collapsed(tmp_path, paper):
     store = PaperStore(tmp_path)
     store.upsert([paper(), paper(arxiv_id="2610.10000")], day=DAY)
-    before = snapshot(tmp_path)
-    with pytest.raises(ValueError, match="ambiguous"):
-        store.upsert([paper(arxiv_id=None, arxiv_version=None)], day=NEXT)
-    assert snapshot(tmp_path) == before
-    assert len(store.load()) == 2
+    # Only unresolved records are indexed by title; a weak incoming identity
+    # cannot select either identified paper just because its title is equal.
+    unresolved = paper(arxiv_id=None, arxiv_version=None)
+    result = store.upsert([unresolved], day=NEXT)
+    assert result.new == [unresolved.paper_id]
+    assert result.updated == []
+    assert result.errors == []
+    assert len(store.load()) == 3
 
 
-def test_conflicting_doi_identity_is_rejected_before_writes(tmp_path, paper):
+@pytest.mark.parametrize("field", ["doi", "arxiv_id"])
+def test_identifier_conflict_skips_one_record_and_continues(tmp_path, paper, field):
     store = PaperStore(tmp_path)
-    store.upsert([paper(doi="10.1234/test")], day=DAY)
+    existing = paper(doi="10.1234/existing")
+    store.upsert([existing], day=DAY)
+    changes = {"doi": "10.1234/conflict"} if field == "doi" else {"arxiv_id": "2610.40000"}
+    conflict = paper(doi="10.1234/existing", sources=["scholar_alert"]) if field == "arxiv_id" else existing
+    conflict = Paper.model_validate({**conflict.model_dump(exclude={"paper_id"}), **changes})
+    valid_before = paper(arxiv_id="2610.10000", title="A valid paper before conflict")
+    valid_after = paper(arxiv_id="2610.90000", title="A valid paper after conflict")
+    batch = [valid_before, conflict, valid_after]
+    result = store.upsert(batch, day=NEXT)
+    assert store.load()[existing.paper_id] == existing
+    assert set(store.load()) == {existing.paper_id, valid_before.paper_id, valid_after.paper_id}
+    assert result.new == sorted([valid_before.paper_id, valid_after.paper_id])
+    assert result.updated == []
+    assert len(result.errors) == 1
+    error = result.errors[0]
+    assert error.model_dump(mode="json") == {
+        "code": "identifier_conflict", "paper_id": conflict.paper_id,
+        "matched_ids": [existing.paper_id], "field": field,
+        "message": f"conflicting {field} for a merged paper", "sources": conflict.sources,
+    }
+    # PR 4 can use the serializable returned errors without changing PR 1's
+    # persisted daily contract, and replaying the failed input remains stable.
+    daily = json.loads((tmp_path / "daily/2026-10-29.json").read_bytes())
+    assert "errors" not in daily
+    assert daily["new"] == result.new
     before = snapshot(tmp_path)
-    with pytest.raises(ValueError, match="conflicting arxiv_id"):
-        store.upsert([paper(arxiv_id="2610.10000", doi="10.1234/test")], day=NEXT)
+    assert store.upsert(reversed(batch), day=NEXT) == result
     assert snapshot(tmp_path) == before
+
+
+def test_conflicting_candidate_group_does_not_mutate_records_or_indexes(tmp_path, paper):
+    store = PaperStore(tmp_path)
+    first = paper(doi="10.1234/first")
+    second = paper(arxiv_id="2610.50000", doi="10.1234/second", abstract=None)
+    store.upsert([first, second], day=DAY)
+    conflict = paper(doi=second.doi)  # paper_id matches first, DOI matches second
+    valid = paper(arxiv_id=None, arxiv_version=None, doi=second.doi, abstract="Fill the gap")
+    result = store.upsert([conflict, valid], day=NEXT)
+    assert len(result.errors) == 1
+    assert result.errors[0].matched_ids == sorted([first.paper_id, second.paper_id])
+    assert store.load()[first.paper_id] == first
+    assert store.load()[second.paper_id].abstract == "Fill the gap"
+    assert result.new == []
+    assert result.updated == [second.paper_id]
+
+
+def test_title_and_doi_indexes_follow_same_batch_promotions(tmp_path, paper):
+    store = PaperStore(tmp_path)
+    unresolved = paper(arxiv_id=None, arxiv_version=None)
+    with_doi = paper(arxiv_id=None, arxiv_version=None, doi="10.1234/test", first_seen="2026-10-28T02:00:00Z", last_updated=None)
+    with_arxiv = paper(doi=with_doi.doi, first_seen="2026-10-28T03:00:00Z", last_updated=None)
+    same_title_other_id = paper(arxiv_id="2610.50000", first_seen="2026-10-28T04:00:00Z", last_updated=None)
+    result = store.upsert([same_title_other_id, with_arxiv, with_doi, unresolved], day=DAY)
+    assert result.errors == []
+    assert set(store.load()) == {with_arxiv.paper_id, same_title_other_id.paper_id}
+    assert store.load()[with_arxiv.paper_id].first_seen == unresolved.first_seen
+    before = snapshot(tmp_path)
+    store.upsert([unresolved, with_doi, with_arxiv, same_title_other_id], day=DAY)
+    assert snapshot(tmp_path) == before
+
+
+def test_title_normalization_work_is_linear(tmp_path, paper, monkeypatch):
+    store = PaperStore(tmp_path)
+    known = [paper(arxiv_id=f"2610.{i:05d}", title=f"Known {i}") for i in range(200)]
+    unresolved = [paper(arxiv_id=None, arxiv_version=None, title=f"Pending {i}") for i in range(20)]
+    store.upsert([*known, *unresolved], day=DAY)
+    calls = 0
+    normalize = store_module.normalize_title
+
+    def counted(title):
+        nonlocal calls
+        calls += 1
+        return normalize(title)
+
+    monkeypatch.setattr(store_module, "normalize_title", counted)
+    new = [paper(arxiv_id=f"2610.{600 + i:05d}", title=f"New {i}") for i in range(100)]
+    resolved = [paper(arxiv_id=f"2610.{1000 + i:05d}", title=f"Pending {i}") for i in range(20)]
+    result = store.upsert([*new, *resolved], day=NEXT)
+    assert result.errors == []
+    assert result.new == sorted(p.paper_id for p in new)
+    assert result.updated == sorted(p.paper_id for p in resolved)
+    assert len(store.load()) == 320
+    # Count operations rather than impose a machine-dependent time limit.
+    assert calls <= len(unresolved) + 2 * (len(new) + len(resolved))
 
 
 @pytest.mark.parametrize("corruption", ["invalid json", "wrong shard", "duplicate"])

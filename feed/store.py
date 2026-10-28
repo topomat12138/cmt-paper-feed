@@ -13,6 +13,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,8 +28,33 @@ class DailyManifest(BaseModel):
     updated: list[str] = Field(default_factory=list)
 
 
+class StoreConflict(BaseModel):
+    """A skipped input record; safe to serialize into future daily errors."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["identifier_conflict"] = "identifier_conflict"
+    paper_id: str
+    matched_ids: list[str]
+    field: Literal["arxiv_id", "doi"]
+    message: str
+    sources: list[str]
+
+
+class UpsertResult(DailyManifest):
+    """Daily changes plus conflicts encountered in this invocation only."""
+
+    errors: list[StoreConflict] = Field(default_factory=list)
+
+
+class IdentifierConflict(ValueError):
+    def __init__(self, field: Literal["arxiv_id", "doi"]):
+        self.field = field
+        super().__init__(f"conflicting {field} for a merged paper")
+
+
 def merge_papers(existing: Paper, incoming: Paper) -> Paper:
-    """Merge matching identities, preserving populated fields and first_seen.
+    """Merge matching identities, preserving populated fields and earliest sighting.
 
     Older revisions may fill gaps but cannot replace newer metadata. Sources,
     categories and individual links are merged without losing existing values.
@@ -37,8 +63,9 @@ def merge_papers(existing: Paper, incoming: Paper) -> Paper:
     for field in ("arxiv_id", "doi"):
         left, right = getattr(existing, field), getattr(incoming, field)
         if left and right and left != right:
-            raise ValueError(f"conflicting {field} for a merged paper")
+            raise IdentifierConflict(field)
     data = existing.model_dump()
+    data["first_seen"] = min(existing.first_seen, incoming.first_seen)
     old_revision = (existing.arxiv_version or 0, existing.last_updated)
     new_revision = (incoming.arxiv_version or 0, incoming.last_updated)
     prefer_incoming = new_revision >= old_revision
@@ -59,6 +86,47 @@ def merge_papers(existing: Paper, incoming: Paper) -> Paper:
         return existing
     data["last_updated"] = max(existing.last_updated, incoming.last_updated)
     return Paper.model_validate(data)
+
+
+class _PaperIndex:
+    """Incremental DOI and unresolved-title indexes over the paper_id map."""
+
+    def __init__(self, papers: dict[str, Paper]):
+        self.papers = papers
+        self.by_doi: dict[str, set[str]] = defaultdict(set)
+        self.by_title: dict[str, set[str]] = defaultdict(set)
+        self.title_keys: dict[str, str] = {}
+        for paper in papers.values():
+            self.add(paper)
+
+    def add(self, paper: Paper) -> None:
+        if paper.doi:
+            self.by_doi[paper.doi].add(paper.paper_id)
+        if paper.paper_id.startswith("title:"):
+            title = normalize_title(paper.title)
+            self.by_title[title].add(paper.paper_id)
+            self.title_keys[paper.paper_id] = title
+
+    def remove(self, paper: Paper) -> None:
+        if paper.doi:
+            bucket = self.by_doi[paper.doi]
+            bucket.remove(paper.paper_id)
+            if not bucket:
+                del self.by_doi[paper.doi]
+        if paper.paper_id in self.title_keys:
+            title = self.title_keys.pop(paper.paper_id)
+            bucket = self.by_title[title]
+            bucket.remove(paper.paper_id)
+            if not bucket:
+                del self.by_title[title]
+
+    def matches(self, paper: Paper) -> set[str]:
+        matched = {paper.paper_id} if paper.paper_id in self.papers else set()
+        if paper.doi:
+            matched.update(self.by_doi.get(paper.doi, ()))
+        if self.by_title:
+            matched.update(self.by_title.get(normalize_title(paper.title), ()))
+        return matched
 
 
 def _shard(paper: Paper) -> Path:
@@ -110,18 +178,22 @@ class PaperStore:
                 papers[paper.paper_id] = paper
         return papers
 
-    def upsert(self, incoming: Iterable[Paper], *, day: date) -> DailyManifest:
+    def upsert(self, incoming: Iterable[Paper], *, day: date) -> UpsertResult:
         """Merge a batch and accumulate a sorted daily change manifest.
 
         Identifier upgrades count as updates. A paper first added today stays
         in `new` if updated again today. Replaying a batch changes no bytes.
+        Conflicting inputs are skipped and returned in errors; valid inputs
+        continue. On-disk corruption and I/O errors still fail the operation.
         """
         if type(day) is not date:
             raise TypeError("day must be a datetime.date")
         original = self.load()
         papers = dict(original)
+        index = _PaperIndex(papers)
         origins = {key: {key} for key in papers}
         aliases = {}
+        errors = []
         daily_path = self.root / "daily" / f"{day.isoformat()}.json"
         daily = DailyManifest.model_validate_json(daily_path.read_bytes()) if daily_path.exists() else DailyManifest(date=day)
         if daily.date != day:
@@ -130,31 +202,32 @@ class PaperStore:
         # Normalize batch order, including duplicate records, before any writes.
         batch = sorted(incoming, key=lambda p: (p.first_seen, p.paper_id, p.last_updated, p.model_dump_json()))
         for paper in batch:
-            title = normalize_title(paper.title)
-            matches = [key for key, old in papers.items() if (
-                key == paper.paper_id
-                or (paper.doi is not None and paper.doi == old.doi)
-                or (title and normalize_title(old.title) == title
-                    and (key.startswith("title:") or paper.paper_id.startswith("title:")))
-            )]
-            # Never guess between distinct identified papers with the same title.
-            strong_ids = {key for key in matches if not key.startswith("title:")}
-            if paper.paper_id.startswith("title:") and len(strong_ids) > 1:
-                raise ValueError("ambiguous title-only identity")
+            matches = index.matches(paper)
             previous_ids = set()
             if matches:
                 ordered = sorted(matches, key=lambda key: (papers[key].first_seen, key))
                 merged = papers[ordered[0]]
-                for key in ordered[1:]:
-                    merged = merge_papers(merged, papers[key])
-                paper = merge_papers(merged, paper)
+                try:
+                    for key in ordered[1:]:
+                        merged = merge_papers(merged, papers[key])
+                    merged = merge_papers(merged, paper)
+                except IdentifierConflict as error:
+                    errors.append(StoreConflict(
+                        paper_id=paper.paper_id, matched_ids=sorted(matches),
+                        field=error.field, message=str(error), sources=paper.sources,
+                    ))
+                    continue
+                # Commit this record only after every candidate merged cleanly.
+                paper = merged
                 for key in matches:
+                    index.remove(papers[key])
                     previous_ids.update(origins.pop(key))
                     del papers[key]
                     if key != paper.paper_id:
                         aliases[key] = paper.paper_id
             papers[paper.paper_id] = paper
             origins[paper.paper_id] = previous_ids
+            index.add(paper)
 
         def current_id(key: str) -> str:
             while key in aliases:
@@ -181,4 +254,4 @@ class PaperStore:
                 content = b"".join(_json(p.model_dump(mode="json")) for p in sorted(shards[relative], key=lambda p: p.paper_id))
                 _write_if_changed(path, content)
         _write_if_changed(daily_path, _json(daily.model_dump(mode="json")))
-        return daily
+        return UpsertResult(**daily.model_dump(), errors=errors)
