@@ -1,9 +1,9 @@
 # cmt-paper-feed
 
 Public paper metadata for downstream tools. The implementation follows
-[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 2**:
+[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 3**:
 the uv project, Pydantic v2 data contract, monthly JSONL storage, and the arXiv
-listing/API source. Historical import is reserved for PR 3.
+listing/API source, plus offline historical backfill.
 
 ## Development
 
@@ -67,6 +67,46 @@ The two pages contain 38 and 17 entries across all three sections, with
 53 unique IDs after deduplication. Tests use `httpx.MockTransport`; a suite-wide
 socket guard prevents accidental live network access. Batch-boundary and error
 tests mutate copies of these recordings in memory.
+
+## Historical backfill
+
+Check out the public legacy repository's `data` branch, then pass its root
+directory and a separate destination data checkout:
+
+```sh
+git clone --depth 1 --single-branch --branch data https://github.com/topomat12138/daily-arXiv-ai-enhanced.git /tmp/legacy-arxiv
+uv run feed backfill --source-dir /tmp/legacy-arxiv --data-dir /path/to/data-checkout
+```
+
+The default inclusive range is 2026-04-11 through 2026-10-27; override it with
+`--start YYYY-MM-DD --end YYYY-MM-DD`. Only exact `data/YYYY-MM-DD.jsonl`
+filenames are read, without recursion. Enhanced JSONL, Markdown, `config/`,
+`feedback/`, and records outside the range are ignored. Backfill performs no
+network requests and never loads source configuration.
+
+Each raw record maps `summary` to `abstract` and its file date to `announced`.
+Both observation timestamps start at that file date's **00:00 UTC**, so records
+are partitioned by historical month, rather than by the backfill run time.
+`submitted` and `listing_type` are null and sources is `["arxiv_listing"]`.
+Missing arXiv versions stay null; no metadata is fetched to fill them. Without
+an explicit primary category, the first legacy category is used.
+
+Backfill validates all input rows before writing and reuses `PaperStore`'s
+indexed merge once for the full batch. Repeated IDs retain the earliest
+`first_seen`; later historical metadata may advance `last_updated` to another
+historical file date. Existing newer live metadata and its timestamp remain
+protected by the normal merge rules.
+
+**Backfill never reads, creates, or updates `daily/` files.** It calls upsert
+with `write_daily=False`, including when importing into a live data checkout.
+Its JSON stdout report contains source file/row counts, unique IDs, date range,
+per-invocation new/updated counts, stored count, and conflicts. Errors return a
+nonzero exit status. Unchanged replays produce no file changes.
+
+The [real import report](docs/pr3-validation.md) records 193 source files,
+4253 input rows, **2855 unique arXiv IDs**, seven monthly shards and the SHA-256
+comparison across two imports. The specification's approximately 4200 estimate
+matches the raw row count, not the unique-paper count in this source snapshot.
 
 ## Data contract and storage
 
@@ -147,7 +187,6 @@ Matching builds indexes once and performs dictionary lookups per input instead
 of scanning and re-normalizing every stored title. Tests bound normalization
 calls by the input/store size, without machine-dependent timing assertions.
 
-The store performs no fuzzy deduplication or metadata resolution. Historical
-import, data-branch Git synchronization, daily scheduling, embeddings, indexing,
-and email access belong to subsequent PRs. This PR never imports the old 4200
-papers or changes the existing tracker.
+The store performs no fuzzy deduplication or metadata resolution. Data-branch
+Git synchronization, daily scheduling, embeddings, indexing, and email access
+belong to subsequent PRs. Backfill never changes the legacy tracker.
