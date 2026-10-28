@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Public, source-neutral paper metadata for downstream research tools"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.10,<3"]
+dependencies = ["pydantic>=2.10,<3", "httpx>=0.28,<1", "beautifulsoup4>=4.13,<5", "pyyaml>=6,<7"]
+
+[project.scripts]
+feed = "feed.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10"]

@@ -1,8 +1,9 @@
 # cmt-paper-feed
 
 Public paper metadata for downstream tools. The implementation follows
-[`docs/spec-layer1.md`](docs/spec-layer1.md). This PR implements **PR 1 only**:
-the uv project, Pydantic v2 data contract, monthly JSONL storage, and tests.
+[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 2**:
+the uv project, Pydantic v2 data contract, monthly JSONL storage, and the arXiv
+listing/API source. Historical import is reserved for PR 3.
 
 ## Development
 
@@ -16,6 +17,46 @@ uv run --no-sync pytest
 `test.yml` runs these checks on pull requests and pushes to `main`, on Python
 3.11, 3.12, and 3.13. Tests use synthetic records and temporary directories and
 make no network requests. Installing dependencies requires network access.
+
+## arXiv ingestion
+
+```sh
+uv run feed ingest --data-dir /path/to/data-checkout --date 2026-10-28
+```
+
+`--config` defaults to `config/sources.yml`; `--date` defaults to today's UTC
+date. The configured categories are `cond-mat.mes-hall` and
+`cond-mat.supr-con`, as requested for PR 2. The source reads all three sections
+of `https://arxiv.org/list/<category>/new?show=2000`: new submissions,
+cross-listings, and replacements. It retains cross-listings even when the
+primary category is outside the configured categories. For a paper appearing
+in multiple sections/categories, `new` takes precedence over `cross`, then
+`replacement`, and the highest explicitly listed version is requested.
+
+Metadata is fetched from the arXiv Atom API using `id_list`, in batches of at
+most 100 unique IDs. All requests, including retries, start at least three
+seconds apart. Transient failures retry at most three times. The source maps
+the original API publication date to `submitted`, the listing date to
+`announced`, and the observation time to `first_seen`/`last_updated`. All records
+have `sources: ["arxiv_listing"]` and pass through the existing `PaperStore`
+merge logic. Replaying unchanged inputs leaves stored bytes unchanged.
+
+On weekends/holidays, when `/new` still shows the previous announcement, the
+source writes an empty daily manifest for the requested date. An explicitly
+empty listing also succeeds. Malformed/partial listings, missing API entries,
+and failed requests return a nonzero exit status before any records are written.
+The command prints only counts and structured store conflicts.
+
+`/new` only exposes the latest announcement. A requested date older than the
+page's announcement fails explicitly rather than ingesting the wrong day;
+arbitrary historical listing replay is not implemented in this PR.
+
+Recorded HTML and XML for 2026-10-28 are in
+[`tests/fixtures/arxiv/2026-10-28`](tests/fixtures/arxiv/2026-10-28).
+The two pages contain 38 and 17 entries across all three sections, with
+53 unique IDs after deduplication. Tests use `httpx.MockTransport`; a suite-wide
+socket guard prevents accidental live network access. Batch-boundary and error
+tests mutate copies of these recordings in memory.
 
 ## Data contract and storage
 
@@ -96,6 +137,7 @@ Matching builds indexes once and performs dictionary lookups per input instead
 of scanning and re-normalizing every stored title. Tests bound normalization
 calls by the input/store size, without machine-dependent timing assertions.
 
-The store performs no fuzzy deduplication or metadata resolution. Source
-adapters, CLI ingestion, historical import, data-branch Git synchronization,
-embeddings, indexing, and email access belong to subsequent PRs.
+The store performs no fuzzy deduplication or metadata resolution. Historical
+import, data-branch Git synchronization, daily scheduling, embeddings, indexing,
+and email access belong to subsequent PRs. This PR never imports the old 4200
+papers or changes the existing tracker.

@@ -1,8 +1,17 @@
 from collections.abc import Callable
 
 import pytest
+import socket
 
 from feed.schema import Paper
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    def reject(*args, **kwargs):
+        raise AssertionError("tests must replay recorded responses, not open sockets")
+    monkeypatch.setattr(socket.socket, "connect", reject)
+    monkeypatch.setattr(socket, "create_connection", reject)
 
 
 @pytest.fixture

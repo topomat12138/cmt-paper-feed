@@ -1,0 +1,2 @@
+# Preserve verbatim upstream HTML recordings, including trailing whitespace.
+tests/fixtures/arxiv/**/*.html whitespace=-blank-at-eol
