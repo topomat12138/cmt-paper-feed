@@ -1,4 +1,4 @@
-"""PR 2 ingestion entry point; other commands arrive in their own PRs."""
+"""Current arXiv ingestion and offline legacy backfill entry points."""
 
 import argparse
 import json
@@ -10,6 +10,7 @@ import httpx
 import yaml
 from pydantic import ValidationError
 
+from feed.backfill import DEFAULT_END, DEFAULT_START, BackfillError, backfill
 from feed.config import load_config
 from feed.sources import SourceError, get_source
 from feed.store import PaperStore
@@ -22,7 +23,20 @@ def main(argv: list[str] | None = None) -> int:
     ingest.add_argument("--data-dir", type=Path, required=True, help="separate data branch checkout")
     ingest.add_argument("--config", type=Path, default=Path("config/sources.yml"))
     ingest.add_argument("--date", type=date.fromisoformat, help="optional check against the page announcement date")
+    history = commands.add_parser("backfill", help="import raw JSONL from a local legacy data-branch checkout")
+    history.add_argument("--source-dir", type=Path, required=True, help="legacy checkout root containing data/")
+    history.add_argument("--data-dir", type=Path, required=True, help="separate destination data checkout")
+    history.add_argument("--start", type=date.fromisoformat, default=DEFAULT_START)
+    history.add_argument("--end", type=date.fromisoformat, default=DEFAULT_END)
     args = parser.parse_args(argv)
+    if args.command == "backfill":
+        try:
+            result = backfill(source_dir=args.source_dir, data_dir=args.data_dir, start=args.start, end=args.end)
+        except (BackfillError, OSError, ValueError):
+            print("backfill failed; source or storage is invalid", file=sys.stderr)
+            return 1
+        print(result.model_dump_json())
+        return 1 if result.errors else 0
     try:
         config = load_config(args.config)
         with httpx.Client(timeout=60, follow_redirects=True) as client:

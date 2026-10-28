@@ -186,13 +186,15 @@ class PaperStore:
                 papers[paper.paper_id] = paper
         return papers
 
-    def upsert(self, incoming: Iterable[Paper], *, day: date) -> UpsertResult:
-        """Merge a batch and accumulate a sorted daily change manifest.
+    def upsert(self, incoming: Iterable[Paper], *, day: date, write_daily: bool = True) -> UpsertResult:
+        """Merge a batch and optionally accumulate a daily change manifest.
 
         Identifier upgrades count as updates. A paper first added today stays
         in `new` if updated again today. Replaying a batch changes no bytes.
         Conflicting inputs are skipped and returned in errors; valid inputs
         continue. On-disk corruption and I/O errors still fail the operation.
+        write_daily=False never reads or writes daily files; returned changes
+        then describe this invocation only (used by historical backfill).
         """
         if type(day) is not date:
             raise TypeError("day must be a datetime.date")
@@ -203,7 +205,7 @@ class PaperStore:
         aliases = {}
         errors = []
         daily_path = self.root / "daily" / f"{day.isoformat()}.json"
-        daily = DailyManifest.model_validate_json(daily_path.read_bytes()) if daily_path.exists() else DailyManifest(date=day)
+        daily = DailyManifest.model_validate_json(daily_path.read_bytes()) if write_daily and daily_path.exists() else DailyManifest(date=day)
         if daily.date != day:
             raise ValueError("daily manifest date does not match its filename")
 
@@ -270,5 +272,6 @@ class PaperStore:
             else:
                 content = b"".join(_json(p.model_dump(mode="json")) for p in sorted(shards[relative], key=lambda p: p.paper_id))
                 _write_if_changed(path, content)
-        _write_if_changed(daily_path, _json(daily.model_dump(mode="json")))
+        if write_daily:
+            _write_if_changed(daily_path, _json(daily.model_dump(mode="json")))
         return UpsertResult(**daily.model_dump(), errors=errors)
