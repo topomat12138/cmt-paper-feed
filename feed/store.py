@@ -33,10 +33,10 @@ class StoreConflict(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    code: Literal["identifier_conflict"] = "identifier_conflict"
+    code: Literal["identifier_conflict", "ambiguous_title"] = "identifier_conflict"
     paper_id: str
     matched_ids: list[str]
-    field: Literal["arxiv_id", "doi"]
+    field: Literal["arxiv_id", "doi", "title"]
     message: str
     sources: list[str]
 
@@ -89,12 +89,13 @@ def merge_papers(existing: Paper, incoming: Paper) -> Paper:
 
 
 class _PaperIndex:
-    """Incremental DOI and unresolved-title indexes over the paper_id map."""
+    """Incremental DOI and title indexes over the paper_id map."""
 
     def __init__(self, papers: dict[str, Paper]):
         self.papers = papers
         self.by_doi: dict[str, set[str]] = defaultdict(set)
         self.by_title: dict[str, set[str]] = defaultdict(set)
+        self.unresolved_by_title: dict[str, set[str]] = defaultdict(set)
         self.title_keys: dict[str, str] = {}
         for paper in papers.values():
             self.add(paper)
@@ -102,10 +103,11 @@ class _PaperIndex:
     def add(self, paper: Paper) -> None:
         if paper.doi:
             self.by_doi[paper.doi].add(paper.paper_id)
+        title = normalize_title(paper.title)
+        self.by_title[title].add(paper.paper_id)
+        self.title_keys[paper.paper_id] = title
         if paper.paper_id.startswith("title:"):
-            title = normalize_title(paper.title)
-            self.by_title[title].add(paper.paper_id)
-            self.title_keys[paper.paper_id] = title
+            self.unresolved_by_title[title].add(paper.paper_id)
 
     def remove(self, paper: Paper) -> None:
         if paper.doi:
@@ -119,13 +121,19 @@ class _PaperIndex:
             bucket.remove(paper.paper_id)
             if not bucket:
                 del self.by_title[title]
+            if paper.paper_id.startswith("title:"):
+                bucket = self.unresolved_by_title[title]
+                bucket.remove(paper.paper_id)
+                if not bucket:
+                    del self.unresolved_by_title[title]
 
     def matches(self, paper: Paper) -> set[str]:
         matched = {paper.paper_id} if paper.paper_id in self.papers else set()
         if paper.doi:
             matched.update(self.by_doi.get(paper.doi, ()))
-        if self.by_title:
-            matched.update(self.by_title.get(normalize_title(paper.title), ()))
+        titles = self.by_title if paper.paper_id.startswith("title:") else self.unresolved_by_title
+        if titles:
+            matched.update(titles.get(normalize_title(paper.title), ()))
         return matched
 
 
@@ -203,6 +211,15 @@ class PaperStore:
         batch = sorted(incoming, key=lambda p: (p.first_seen, p.paper_id, p.last_updated, p.model_dump_json()))
         for paper in batch:
             matches = index.matches(paper)
+            if paper.paper_id.startswith("title:"):
+                identified = {key for key in matches if not key.startswith("title:")}
+                if len(identified) > 1:
+                    errors.append(StoreConflict(
+                        code="ambiguous_title", paper_id=paper.paper_id,
+                        matched_ids=sorted(matches), field="title", sources=paper.sources,
+                        message="multiple identified papers share the normalized title",
+                    ))
+                    continue
             previous_ids = set()
             if matches:
                 ordered = sorted(matches, key=lambda key: (papers[key].first_seen, key))

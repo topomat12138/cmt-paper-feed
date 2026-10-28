@@ -237,17 +237,79 @@ def test_promotion_collapses_existing_target_and_removes_empty_shard(tmp_path, p
     assert not (tmp_path / "papers/2026/2026-10.jsonl").exists()
 
 
-def test_distinct_identified_papers_with_same_title_are_not_collapsed(tmp_path, paper):
+@pytest.mark.parametrize("identity", ["arxiv", "doi"])
+def test_title_only_input_merges_into_unique_identified_paper(tmp_path, paper, identity):
     store = PaperStore(tmp_path)
-    store.upsert([paper(), paper(arxiv_id="2610.10000")], day=DAY)
-    # Only unresolved records are indexed by title; a weak incoming identity
-    # cannot select either identified paper just because its title is equal.
-    unresolved = paper(arxiv_id=None, arxiv_version=None)
+    existing = paper() if identity == "arxiv" else paper(arxiv_id=None, arxiv_version=None, doi="10.1234/test")
+    store.upsert([existing], day=DAY)
+    unresolved = paper(
+        arxiv_id=None, arxiv_version=None, title=r"Ａ \textbf{synthetic} paper!",
+        sources=["scholar_alert"], authors=[], abstract=None,
+        first_seen=LATER, last_updated=LATER,
+    )
     result = store.upsert([unresolved], day=NEXT)
-    assert result.new == [unresolved.paper_id]
-    assert result.updated == []
+    assert result.new == []
+    assert result.updated == [existing.paper_id]
     assert result.errors == []
-    assert len(store.load()) == 3
+    assert list(store.load()) == [existing.paper_id]
+    merged = store.load()[existing.paper_id]
+    assert merged.sources == ["arxiv_listing", "scholar_alert"]
+    assert merged.abstract == existing.abstract
+    assert merged.arxiv_id == existing.arxiv_id
+    assert merged.doi == existing.doi
+    before = snapshot(tmp_path)
+    # Rebuild the all-record title index from disk and replay the weak input.
+    assert PaperStore(tmp_path).upsert([unresolved], day=NEXT) == result
+    assert snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("identities", ["arxiv/arxiv", "arxiv/doi", "doi/doi"])
+def test_ambiguous_title_skips_input_and_keeps_identified_papers_separate(tmp_path, paper, identities):
+    store = PaperStore(tmp_path)
+    kinds = identities.split("/")
+    first = paper() if kinds[0] == "arxiv" else paper(arxiv_id=None, arxiv_version=None, doi="10.1234/first")
+    second = paper(arxiv_id="2610.10000") if kinds[1] == "arxiv" else paper(arxiv_id=None, arxiv_version=None, doi="10.1234/second")
+    store.upsert([first, second], day=DAY)
+    assert len(store.load()) == 2  # Identified inputs do not match by title.
+    unresolved = paper(arxiv_id=None, arxiv_version=None, sources=["scholar_alert"])
+    valid = paper(arxiv_id="2610.90000", title="An unrelated valid paper", first_seen=LATER, last_updated=LATER)
+    result = store.upsert([unresolved, valid], day=NEXT)
+    assert result.new == [valid.paper_id]
+    assert result.updated == []
+    assert len(result.errors) == 1
+    assert result.errors[0].model_dump(mode="json") == {
+        "code": "ambiguous_title", "paper_id": unresolved.paper_id,
+        "matched_ids": sorted([first.paper_id, second.paper_id]), "field": "title",
+        "message": "multiple identified papers share the normalized title",
+        "sources": ["scholar_alert"],
+    }
+    assert store.load() == {p.paper_id: p for p in (first, second, valid)}
+    before = snapshot(tmp_path)
+    assert store.upsert([unresolved, valid], day=NEXT) == result
+    assert snapshot(tmp_path) == before
+
+
+def test_title_index_tracks_identified_title_changes_within_batch(tmp_path, paper):
+    store = PaperStore(tmp_path)
+    original = paper(title="Old synthetic title")
+    store.upsert([original], day=DAY)
+    revised = paper(
+        arxiv_version=2, title="Revised synthetic title", first_seen=LATER, last_updated=LATER,
+    )
+    old_title = paper(
+        arxiv_id=None, arxiv_version=None, title=original.title,
+        first_seen="2026-10-29T02:00:00Z", last_updated=None,
+    )
+    new_title = paper(
+        arxiv_id=None, arxiv_version=None, title=revised.title, sources=["scholar_alert"],
+        first_seen="2026-10-29T03:00:00Z", last_updated=None,
+    )
+    result = store.upsert([new_title, old_title, revised], day=NEXT)
+    assert result.errors == []
+    assert result.new == [old_title.paper_id]
+    assert result.updated == [original.paper_id]
+    assert set(store.load()) == {original.paper_id, old_title.paper_id}
+    assert store.load()[original.paper_id].sources == ["arxiv_listing", "scholar_alert"]
 
 
 @pytest.mark.parametrize("field", ["doi", "arxiv_id"])
@@ -310,7 +372,9 @@ def test_title_and_doi_indexes_follow_same_batch_promotions(tmp_path, paper):
     assert set(store.load()) == {with_arxiv.paper_id, same_title_other_id.paper_id}
     assert store.load()[with_arxiv.paper_id].first_seen == unresolved.first_seen
     before = snapshot(tmp_path)
-    store.upsert([unresolved, with_doi, with_arxiv, same_title_other_id], day=DAY)
+    replay = store.upsert([unresolved, with_doi, with_arxiv, same_title_other_id], day=DAY)
+    assert len(replay.errors) == 1
+    assert replay.errors[0].code == "ambiguous_title"
     assert snapshot(tmp_path) == before
 
 
@@ -336,7 +400,7 @@ def test_title_normalization_work_is_linear(tmp_path, paper, monkeypatch):
     assert result.updated == sorted(p.paper_id for p in resolved)
     assert len(store.load()) == 320
     # Count operations rather than impose a machine-dependent time limit.
-    assert calls <= len(unresolved) + 2 * (len(new) + len(resolved))
+    assert calls <= len(known) + len(unresolved) + 2 * (len(new) + len(resolved))
 
 
 @pytest.mark.parametrize("corruption", ["invalid json", "wrong shard", "duplicate"])

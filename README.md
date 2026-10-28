@@ -69,13 +69,17 @@ Merge behavior:
   from restoring old metadata.
 - `last_updated` advances only for a metadata change. New observation timestamps
   alone do not rewrite records.
-- Matching uses a paper_id map, a DOI index, and a normalized-title index built
-  only for unresolved `title:` records. Indexes are updated after every successful
-  merge, including identifier upgrades; known DOI/arXiv records are matched by
-  identifiers rather than an incoming weak title alone. The strongest ID wins.
+- Matching uses a paper_id map, a DOI index, and a normalized-title index for
+  all records. An incoming `title:` record merges into an identified record
+  only when exactly one identified record matches its normalized title. Multiple
+  identified matches skip that input and return an `ambiguous_title` error.
+  Identified records never merge with each other by title alone; an unresolved
+  title subindex supports their upgrades without scanning identified candidates.
+  Indexes follow each successful merge, including ID and title changes. The
+  strongest ID wins.
 - Conflicting arXiv/DOI identifiers skip only that input record. All matched
   stored records and indexes stay unchanged, and other inputs continue. The
-  returned `UpsertResult.errors` contains structured conflicts with the input
+  returned `UpsertResult.errors` contains structured errors with the input
   paper_id, matched IDs, field, sources, and a generic message. Errors describe
   this invocation only; PR 4 can serialize them into daily errors. Corrupt
   on-disk data and I/O failures still raise exceptions.
