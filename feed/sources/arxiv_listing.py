@@ -13,14 +13,14 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Literal
+from typing import Literal, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
 
 from feed.schema import Paper
-from feed.sources.base import Source, SourceError, register
+from feed.sources.base import Source, SourceError, SourceResult, register
 
 ListingType = Literal["new", "cross", "replacement"]
 NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -28,6 +28,11 @@ API_URL = "https://export.arxiv.org/api/query"
 USER_AGENT = "cmt-paper-feed/0.1 (https://github.com/topomat12138/cmt-paper-feed)"
 _PRIORITY = {"new": 0, "cross": 1, "replacement": 2}
 _ID = re.compile(r"(?P<id>\d{4}\.\d{4,5}|[A-Za-z.-]+/\d{7})(?:v(?P<version>[1-9]\d*))?")
+_T = TypeVar("_T")
+
+
+class IncompleteMetadataError(SourceError):
+    """A valid Atom feed omitted requested entries and may succeed on retry."""
 
 
 @dataclass(frozen=True)
@@ -145,7 +150,7 @@ def parse_metadata(xml: bytes | str, refs: dict[str, ListingRef], *, announced: 
         except (ValueError, KeyError) as error:
             raise SourceError("invalid arXiv API paper metadata") from error
     if papers.keys() != refs.keys():
-        raise SourceError("arXiv API omitted requested entries")
+        raise IncompleteMetadataError("arXiv API omitted requested entries")
     return [papers[key] for key in sorted(papers)]
 
 
@@ -159,7 +164,7 @@ class ArxivListing(Source):
         self.sleep, self.clock = sleep, clock
         self._last_request: float | None = None
 
-    def _get(self, url: str, params: dict) -> httpx.Response:
+    def _get(self, url: str, params: dict, parse: Callable[[httpx.Response], _T]) -> _T:
         for attempt in range(3):
             if self._last_request is not None:
                 delay = 3.0 - (self.clock() - self._last_request)
@@ -168,34 +173,43 @@ class ArxivListing(Source):
             self._last_request = self.clock()
             try:
                 response = self.client.get(url, params=params, headers={"User-Agent": USER_AGENT})
-                if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
-                    continue
                 response.raise_for_status()
-                return response
+                return parse(response)
+            except IncompleteMetadataError:
+                if attempt == 2:
+                    raise
             except httpx.HTTPError as error:
                 if attempt == 2:
                     raise SourceError("arXiv request failed after three attempts") from error
         raise AssertionError("unreachable")
 
-    def fetch(self, *, day: date, seen_at: datetime) -> list[Paper]:
+    def fetch(self, *, seen_at: datetime, day: date | None = None) -> SourceResult:
         refs: dict[str, ListingRef] = {}
+        dates_by_id: dict[str, date] = {}
+        announcement_dates = set()
         for category in self.categories:
-            page = parse_listing(self._get(f"https://arxiv.org/list/{category}/new", {"show": 2000}).text)
-            if day < page.announced:
-                raise SourceError("requested date predates the current arXiv listing; historical replay is unavailable")
-            if day > page.announced:
-                continue  # Weekends/holidays still show the previous announcement.
+            page = self._get(f"https://arxiv.org/list/{category}/new", {"show": 2000},
+                             lambda response: parse_listing(response.text))
+            if day is not None and day != page.announced:
+                raise SourceError("requested date does not match the current arXiv announcement")
+            announcement_dates.add(page.announced)
             for ref in page.entries:
                 old = refs.get(ref.arxiv_id)
-                if old:
+                if old and page.announced < dates_by_id[ref.arxiv_id]:
+                    continue
+                if old and page.announced == dates_by_id[ref.arxiv_id]:
                     kind = min((old.listing_type, ref.listing_type), key=_PRIORITY.__getitem__)
                     version = max(old.version or 0, ref.version or 0) or None
                     ref = ListingRef(ref.arxiv_id, version, kind)
                 refs[ref.arxiv_id] = ref
+                dates_by_id[ref.arxiv_id] = page.announced
         result = []
-        identifiers = sorted(refs)
-        for start in range(0, len(identifiers), 100):
-            batch = {key: refs[key] for key in identifiers[start:start + 100]}
-            response = self._get(API_URL, {"id_list": ",".join(ref.query_id for ref in batch.values()), "max_results": len(batch)})
-            result.extend(parse_metadata(response.content, batch, announced=day, seen_at=seen_at))
-        return result
+        for announced in sorted(announcement_dates):
+            identifiers = sorted(key for key in refs if dates_by_id[key] == announced)
+            for start in range(0, len(identifiers), 100):
+                batch = {key: refs[key] for key in identifiers[start:start + 100]}
+                result.extend(self._get(
+                    API_URL, {"id_list": ",".join(ref.query_id for ref in batch.values()), "max_results": len(batch)},
+                    lambda response: parse_metadata(response.content, batch, announced=announced, seen_at=seen_at),
+                ))
+        return SourceResult(tuple(sorted(announcement_dates)), result)

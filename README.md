@@ -21,11 +21,13 @@ make no network requests. Installing dependencies requires network access.
 ## arXiv ingestion
 
 ```sh
-uv run feed ingest --data-dir /path/to/data-checkout --date 2026-10-28
+uv run feed ingest --data-dir /path/to/data-checkout
 ```
 
-`--config` defaults to `config/sources.yml`; `--date` defaults to today's UTC
-date. The configured categories are `cond-mat.mes-hall` and
+`--config` defaults to `config/sources.yml`. By default, ingestion follows the
+current announcement shown on each listing page, regardless of the run date.
+`--date YYYY-MM-DD` is an optional validation check: every page must match that
+date, or ingestion fails before writing. The configured categories are `cond-mat.mes-hall` and
 `cond-mat.supr-con`, as requested for PR 2. The source reads all three sections
 of `https://arxiv.org/list/<category>/new?show=2000`: new submissions,
 cross-listings, and replacements. It retains cross-listings even when the
@@ -35,21 +37,29 @@ in multiple sections/categories, `new` takes precedence over `cross`, then
 
 Metadata is fetched from the arXiv Atom API using `id_list`, in batches of at
 most 100 unique IDs. All requests, including retries, start at least three
-seconds apart. Transient failures retry at most three times. The source maps
+seconds apart. HTTP failures and HTTP 200 feeds missing requested entries
+(including empty feeds) share a maximum of three attempts per request. The source maps
 the original API publication date to `submitted`, the listing date to
 `announced`, and the observation time to `first_seen`/`last_updated`. All records
 have `sources: ["arxiv_listing"]` and pass through the existing `PaperStore`
 merge logic. Replaying unchanged inputs leaves stored bytes unchanged.
 
-On weekends/holidays, when `/new` still shows the previous announcement, the
-source writes an empty daily manifest for the requested date. An explicitly
-empty listing also succeeds. Malformed/partial listings, missing API entries,
+On weekends/holidays or a delayed run, `/new` may still show the previous
+announcement. It is ingested again using the page date for both `announced`
+and `daily/<date>.json`; idempotent storage makes repeated runs harmless. Only
+an explicitly empty listing writes an empty manifest for its page date. If
+category pages show different dates, records are grouped into separate daily
+files; duplicate IDs use the newer page date. The source returns a `SourceResult`
+containing papers and announcement dates, retaining dates even for empty pages.
+The CLI prints one report, or an `announcements` list for multiple page dates.
+
+Malformed/partial listings, API entries still missing after three attempts,
 and failed requests return a nonzero exit status before any records are written.
 The command prints only counts and structured store conflicts.
 
-`/new` only exposes the latest announcement. A requested date older than the
-page's announcement fails explicitly rather than ingesting the wrong day;
-arbitrary historical listing replay is not implemented in this PR.
+`/new` only exposes the latest announcement, so at least one successful run
+between consecutive announcements is still required. Arbitrary historical
+listing replay is not implemented in this PR.
 
 Recorded HTML and XML for 2026-10-28 are in
 [`tests/fixtures/arxiv/2026-10-28`](tests/fixtures/arxiv/2026-10-28).

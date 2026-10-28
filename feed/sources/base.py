@@ -1,6 +1,7 @@
 """Source interface and registration; orchestration belongs to later PRs."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date, datetime
 
 from feed.schema import Paper
@@ -10,10 +11,16 @@ class SourceError(RuntimeError):
     """A source could not supply a complete, valid batch."""
 
 
+@dataclass(frozen=True)
+class SourceResult:
+    announcement_dates: tuple[date, ...]
+    papers: list[Paper]
+
+
 class Source(ABC):
     @abstractmethod
-    def fetch(self, *, day: date, seen_at: datetime) -> list[Paper]:
-        """Fetch one announcement date without modifying storage."""
+    def fetch(self, *, seen_at: datetime, day: date | None = None) -> SourceResult:
+        """Fetch current announcements; day optionally checks the page dates."""
 
 
 _SOURCES: dict[str, type[Source]] = {}
