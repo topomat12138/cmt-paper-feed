@@ -1,3 +1,4 @@
+import base64
 import json
 import shutil
 import subprocess
@@ -135,6 +136,7 @@ def test_push_retries_are_bounded_and_git_errors_never_escape(remote, tmp_path, 
     original = workflow.run_git
     pushes, pulls = [], []
     secret = "do-not-log-credential-or-identity"
+    monkeypatch.setenv("FEED_GITHUB_TOKEN", secret)
 
     def reject(directory, *args, **kwargs):
         if args[0] == "push":
@@ -279,7 +281,60 @@ def test_legacy_daily_without_errors_remains_readable(tmp_path):
 def test_workflow_cli_does_not_echo_credential_bearing_errors(tmp_path, capsys):
     assert workflow.main(["checkout", "--directory", str(tmp_path / "data"),
                           "--repository-url", "https://identity:do-not-print@github.com/example/repo.git"]) == 1
-    assert capsys.readouterr() == ("", "")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "repository must use credential-free HTTPS" in captured.err
+    assert "identity" not in captured.err and "do-not-print" not in captured.err
+
+
+@pytest.mark.parametrize("rebase_fails", [False, True])
+def test_failed_push_cli_reports_reason_without_token_auth_or_email(remote, tmp_path, paper, monkeypatch, capsys, rebase_fails):
+    root = seeded_checkout(remote, tmp_path, paper)
+    PaperStore(root).upsert([paper(arxiv_id="2610.90000", announced=DAY)], day=DAY)
+    token = "private-token+canary"
+    encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    monkeypatch.setenv("FEED_GITHUB_TOKEN", token)
+    original = workflow.subprocess.run
+
+    def reject(args, **kwargs):
+        if args[3] == "push":
+            stderr = (f"old noise to omit\nremote: credential {token}; encoded {encoded}\n"
+                      "remote: aUtHoRiZaTiOn: Bearer opaque-private-authentication\n"
+                      f"fatal: rejected https://identity:{token}@github.com/example/repo.git\n"
+                      "remote: account private@example.org\nfatal: write permission denied\n")
+            return subprocess.CompletedProcess(args, 1, "", stderr)
+        if args[3] == "pull" and rebase_fails:
+            return subprocess.CompletedProcess(args, 1, "", "fatal: remote data branch unavailable")
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(workflow.subprocess, "run", reject)
+    assert workflow.main(["publish", "--directory", str(root), "--report", str(report(tmp_path)),
+                          "--kind", "ingest"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert ("data rebase failed" if rebase_fails else "data push failed after three attempts") in captured.err
+    assert "data push failed" in captured.err
+    assert "write permission denied" in captured.err
+    assert "***" in captured.err
+    for private in (token, encoded, "opaque-private-authentication", "identity", "private@example.org", "old noise"):
+        assert private not in captured.err
+
+
+@pytest.mark.parametrize("operation", ["inspect", "clone"])
+def test_checkout_failure_cli_includes_sanitized_git_reason(tmp_path, monkeypatch, capsys, operation):
+    monkeypatch.setenv("FEED_GITHUB_TOKEN", "checkout-token")
+
+    def fail(args, **kwargs):
+        if args[3] == "ls-remote" and operation == "clone":
+            return subprocess.CompletedProcess(args, 0, "refs/heads/data", "")
+        return subprocess.CompletedProcess(args, 128, "", "fatal: access denied for checkout-token")
+
+    monkeypatch.setattr(workflow.subprocess, "run", fail)
+    assert workflow.main(["checkout", "--directory", str(tmp_path / "data"),
+                          "--repository-url", "https://github.com/example/repo.git"]) == 1
+    error = capsys.readouterr().err
+    assert ("cannot inspect data branch" if operation == "inspect" else "Git clone failed") in error
+    assert "access denied" in error and "checkout-token" not in error
 
 
 def test_token_stays_out_of_git_arguments_config_and_output(remote, tmp_path, paper, monkeypatch, capsys):
@@ -327,3 +382,28 @@ def test_workflows_share_lock_have_minimal_permissions_and_publish_before_failin
         commands = "\n".join(step.get("run", "") for step in steps)
         assert "$RUNNER_TEMP/feed-data" in commands
         assert "feed embed" not in commands
+        assert "/dev/null" not in commands
+        summary = next(step for step in steps if "$GITHUB_STEP_SUMMARY" in step.get("run", ""))
+        assert f"steps.{name}.outcome == 'failure'" in summary["if"]
+        assert steps.index(operation) < steps.index(summary) < steps.index(publish)
+
+
+@pytest.mark.parametrize("name", ["ingest", "backfill"])
+@pytest.mark.parametrize("has_report", [True, False])
+def test_workflow_summary_shows_report_or_missing_report_diagnostic(tmp_path, name, has_report):
+    workflow_yaml = yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(), Loader=yaml.BaseLoader)
+    step = next(step for step in workflow_yaml["jobs"][name]["steps"]
+                if "$GITHUB_STEP_SUMMARY" in step.get("run", ""))
+    payload = {"date": DAY.isoformat(), "new": 17, "errors": [{"code": "source_failure"}]}
+    report_path = tmp_path / f"feed-{name}.json"
+    if has_report:
+        report_path.write_text(json.dumps(payload))
+    summary = tmp_path / "summary.md"
+    result = subprocess.run(["bash", "-e", "-c", step["run"]], capture_output=True, text=True,
+                            env={"RUNNER_TEMP": str(tmp_path), "GITHUB_STEP_SUMMARY": str(summary)})
+    assert result.returncode == 0, result.stderr
+    text = summary.read_text()
+    if has_report:
+        assert json.dumps(payload) in text and "```json" in text
+    else:
+        assert "No JSON report was produced" in text

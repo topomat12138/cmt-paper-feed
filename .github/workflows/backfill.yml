@@ -36,13 +36,13 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - name: Install locked runtime
-        run: uv sync --locked --no-dev --quiet > /dev/null 2>&1
+        run: uv sync --locked --no-dev
       - name: Prepare isolated data checkout
         env:
           FEED_GITHUB_TOKEN: ${{ github.token }}
-        run: uv run --no-sync python -m feed.workflow checkout --directory "$RUNNER_TEMP/feed-data" 2>/dev/null
+        run: uv run --no-sync python -m feed.workflow checkout --directory "$RUNNER_TEMP/feed-data"
       - name: Clone raw legacy data
-        run: uv run --no-sync python -m feed.workflow legacy --directory "$RUNNER_TEMP/legacy-data" 2>/dev/null
+        run: uv run --no-sync python -m feed.workflow legacy --directory "$RUNNER_TEMP/legacy-data"
       - name: Import historical records
         id: backfill
         continue-on-error: true
@@ -50,12 +50,25 @@ jobs:
           START_DATE: ${{ inputs.start }}
           END_DATE: ${{ inputs.end }}
         run: |
-          uv run --no-sync feed backfill --source-dir "$RUNNER_TEMP/legacy-data" --data-dir "$RUNNER_TEMP/feed-data" --start "$START_DATE" --end "$END_DATE" > "$RUNNER_TEMP/feed-backfill.json" 2>/dev/null
+          uv run --no-sync feed backfill --source-dir "$RUNNER_TEMP/legacy-data" --data-dir "$RUNNER_TEMP/feed-data" --start "$START_DATE" --end "$END_DATE" > "$RUNNER_TEMP/feed-backfill.json"
+      - name: Summarize historical import
+        if: ${{ !cancelled() && (steps.backfill.outcome == 'success' || steps.backfill.outcome == 'failure') }}
+        run: |
+          {
+            printf '### Historical import report\n\n'
+            if [[ -s "$RUNNER_TEMP/feed-backfill.json" ]]; then
+              printf '```json\n'
+              cat "$RUNNER_TEMP/feed-backfill.json"
+              printf '\n```\n'
+            else
+              printf 'No JSON report was produced. See step errors above.\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish changed historical shards
         if: ${{ !cancelled() && (steps.backfill.outcome == 'success' || steps.backfill.outcome == 'failure') }}
         env:
           FEED_GITHUB_TOKEN: ${{ github.token }}
-        run: uv run --no-sync python -m feed.workflow publish --directory "$RUNNER_TEMP/feed-data" --report "$RUNNER_TEMP/feed-backfill.json" --kind backfill 2>/dev/null
+        run: uv run --no-sync python -m feed.workflow publish --directory "$RUNNER_TEMP/feed-data" --report "$RUNNER_TEMP/feed-backfill.json" --kind backfill
       - name: Mark incomplete backfill as failed
         if: ${{ !cancelled() && steps.backfill.outcome == 'failure' }}
         run: exit 1

@@ -141,10 +141,13 @@ publish step still runs, and a final status step marks the job red afterward.
 Backfill likewise publishes valid changes before reporting any import conflict.
 There is no embedding step.
 
-Business-step reports are redirected to temporary files. Git stdout/stderr is
-captured; token authentication uses process environment rather than repository
-URLs, arguments or persistent Git configuration. No Git identities, raw network
-errors, response bodies, tokens or environment dumps are printed by the scripts.
+Business-step JSON reports are saved in temporary files and copied to the
+Actions step summary, including counts and errors even when ingestion fails.
+Step errors remain visible in logs. Git output is captured; a terminal failure
+prints its operation and the last five error lines per failed operation after
+redacting tokens, Authorization headers, URL credentials and email addresses. Token authentication
+uses process environment rather than repository URLs, arguments or persistent
+Git configuration. HTTP response bodies and environment dumps are not printed.
 
 See [PR 4 validation](docs/pr4-validation.md) for local Git integration checks,
 full-history initialization/replay evidence and the post-merge rollout checks.

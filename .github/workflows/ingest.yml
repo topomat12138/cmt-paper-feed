@@ -33,11 +33,11 @@ jobs:
           python-version: '3.12'
           enable-cache: true
       - name: Install locked runtime
-        run: uv sync --locked --no-dev --quiet > /dev/null 2>&1
+        run: uv sync --locked --no-dev
       - name: Prepare isolated data checkout
         env:
           FEED_GITHUB_TOKEN: ${{ github.token }}
-        run: uv run --no-sync python -m feed.workflow checkout --directory "$RUNNER_TEMP/feed-data" 2>/dev/null
+        run: uv run --no-sync python -m feed.workflow checkout --directory "$RUNNER_TEMP/feed-data"
       - name: Ingest current announcement
         id: ingest
         continue-on-error: true
@@ -49,12 +49,25 @@ jobs:
           if [[ -n "$ANNOUNCEMENT_DATE" ]]; then
             args+=(--date "$ANNOUNCEMENT_DATE")
           fi
-          uv run --no-sync feed ingest --data-dir "$RUNNER_TEMP/feed-data" "${args[@]}" > "$RUNNER_TEMP/feed-ingest.json" 2>/dev/null
+          uv run --no-sync feed ingest --data-dir "$RUNNER_TEMP/feed-data" "${args[@]}" > "$RUNNER_TEMP/feed-ingest.json"
+      - name: Summarize announcement
+        if: ${{ !cancelled() && (steps.ingest.outcome == 'success' || steps.ingest.outcome == 'failure') }}
+        run: |
+          {
+            printf '### Announcement report\n\n'
+            if [[ -s "$RUNNER_TEMP/feed-ingest.json" ]]; then
+              printf '```json\n'
+              cat "$RUNNER_TEMP/feed-ingest.json"
+              printf '\n```\n'
+            else
+              printf 'No JSON report was produced. See step errors above.\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish successful records and diagnostics
         if: ${{ !cancelled() && (steps.ingest.outcome == 'success' || steps.ingest.outcome == 'failure') }}
         env:
           FEED_GITHUB_TOKEN: ${{ github.token }}
-        run: uv run --no-sync python -m feed.workflow publish --directory "$RUNNER_TEMP/feed-data" --report "$RUNNER_TEMP/feed-ingest.json" --kind ingest 2>/dev/null
+        run: uv run --no-sync python -m feed.workflow publish --directory "$RUNNER_TEMP/feed-data" --report "$RUNNER_TEMP/feed-ingest.json" --kind ingest
       - name: Mark incomplete ingestion as failed
         if: ${{ !cancelled() && steps.ingest.outcome == 'failure' }}
         run: exit 1

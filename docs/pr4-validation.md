@@ -2,7 +2,7 @@
 
 ## Offline checks
 
-- **156 tests pass**, including the PR 1–3 suite, real local Git repositories,
+- **164 tests pass**, including the PR 1–3 suite, real local Git repositories,
   and recorded arXiv HTML/XML. The socket guard remains enabled.
 - **actionlint 1.7.12** passes for all workflows. The local Darwin arm64 binary
   was verified against the official SHA-256; CI independently verifies the
@@ -70,10 +70,20 @@ Identified batch records are processed before weak title records. This ensures
 the first run and replay use the same known candidates for ambiguity checks,
 preventing a replay-only diagnostic from creating an otherwise empty commit.
 
-Raw Git output is always captured. Tests verify that credentials are absent
-from Git arguments, persistent config and stdout/stderr, and that source error
-messages cannot copy private response text. Publication rejects main, non-data
-staged files and data checkouts inside the code workspace.
+Raw Git output is always captured. Terminal failures print a readable operation
+error and at most five sanitized stderr lines per failed Git operation. When a
+failed push is followed by a failed pull, both reasons are retained. Tests
+simulate rejected pushes and failed branch inspection/cloning, verifying that diagnostics retain the
+reason but redact tokens, their Basic-auth encoding, Authorization contents,
+URL credentials and email addresses. Credentials remain absent from arguments
+and persistent config, and source messages cannot copy private response text.
+Publication rejects main, non-data staged files and data checkouts inside the
+code workspace.
+
+The workflows retain step stderr and dependency-install diagnostics. Both
+successful and failed ingest/backfill reports are copied to GITHUB_STEP_SUMMARY;
+tests execute the actual summary shell steps and check counts/errors or a
+missing-report diagnostic. Publication still precedes the final failure step.
 
 ## Post-merge rollout
 
