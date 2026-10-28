@@ -1,0 +1,60 @@
+name: Daily arXiv ingest
+
+on:
+  schedule:
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: Optional announcement date check (YYYY-MM-DD)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cmt-paper-feed-data
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '0.13.6'
+          python-version: '3.12'
+          enable-cache: true
+      - name: Install locked runtime
+        run: uv sync --locked --no-dev --quiet > /dev/null 2>&1
+      - name: Prepare isolated data checkout
+        env:
+          FEED_GITHUB_TOKEN: ${{ github.token }}
+        run: uv run --no-sync python -m feed.workflow checkout --directory "$RUNNER_TEMP/feed-data" 2>/dev/null
+      - name: Ingest current announcement
+        id: ingest
+        continue-on-error: true
+        env:
+          ANNOUNCEMENT_DATE: ${{ inputs.date }}
+        shell: bash
+        run: |
+          args=()
+          if [[ -n "$ANNOUNCEMENT_DATE" ]]; then
+            args+=(--date "$ANNOUNCEMENT_DATE")
+          fi
+          uv run --no-sync feed ingest --data-dir "$RUNNER_TEMP/feed-data" "${args[@]}" > "$RUNNER_TEMP/feed-ingest.json" 2>/dev/null
+      - name: Publish successful records and diagnostics
+        if: ${{ !cancelled() && (steps.ingest.outcome == 'success' || steps.ingest.outcome == 'failure') }}
+        env:
+          FEED_GITHUB_TOKEN: ${{ github.token }}
+        run: uv run --no-sync python -m feed.workflow publish --directory "$RUNNER_TEMP/feed-data" --report "$RUNNER_TEMP/feed-ingest.json" --kind ingest 2>/dev/null
+      - name: Mark incomplete ingestion as failed
+        if: ${{ !cancelled() && steps.ingest.outcome == 'failure' }}
+        run: exit 1

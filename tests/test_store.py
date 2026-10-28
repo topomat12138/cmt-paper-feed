@@ -184,7 +184,7 @@ def test_jsonl_sorting_utf8_and_newlines(tmp_path, paper):
     assert "合成标题".encode() in content
     assert content.endswith(b"\n")
     daily = json.loads((tmp_path / "daily/2026-10-28.json").read_bytes())
-    assert daily == {"date": "2026-10-28", "new": ["arxiv:2610.10000", "arxiv:2610.33463"], "updated": []}
+    assert daily == {"date": "2026-10-28", "new": ["arxiv:2610.10000", "arxiv:2610.33463"], "updated": [], "errors": []}
 
 
 def test_empty_batch_creates_empty_daily_and_replays(tmp_path):
@@ -192,7 +192,7 @@ def test_empty_batch_creates_empty_daily_and_replays(tmp_path):
     result = store.upsert([], day=DAY)
     assert result.model_dump(mode="json") == {"date": "2026-10-28", "new": [], "updated": [], "errors": []}
     assert json.loads((tmp_path / "daily/2026-10-28.json").read_bytes()) == {
-        "date": "2026-10-28", "new": [], "updated": [],
+        "date": "2026-10-28", "new": [], "updated": [], "errors": [],
     }
     before = snapshot(tmp_path)
     store.upsert([], day=DAY)
@@ -335,10 +335,10 @@ def test_identifier_conflict_skips_one_record_and_continues(tmp_path, paper, fie
         "matched_ids": [existing.paper_id], "field": field,
         "message": f"conflicting {field} for a merged paper", "sources": conflict.sources,
     }
-    # PR 4 can use the serializable returned errors without changing PR 1's
-    # persisted daily contract, and replaying the failed input remains stable.
+    # The persisted errors use the existing conflict shape, and replaying the
+    # same failed input remains stable.
     daily = json.loads((tmp_path / "daily/2026-10-29.json").read_bytes())
-    assert "errors" not in daily
+    assert daily["errors"] == [error.model_dump(mode="json")]
     assert daily["new"] == result.new
     before = snapshot(tmp_path)
     assert store.upsert(reversed(batch), day=NEXT) == result
@@ -361,20 +361,24 @@ def test_conflicting_candidate_group_does_not_mutate_records_or_indexes(tmp_path
     assert result.updated == [second.paper_id]
 
 
-def test_title_and_doi_indexes_follow_same_batch_promotions(tmp_path, paper):
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_title_and_doi_promotions_and_diagnostics_are_replay_stable(tmp_path, paper, ambiguous):
     store = PaperStore(tmp_path)
     unresolved = paper(arxiv_id=None, arxiv_version=None)
     with_doi = paper(arxiv_id=None, arxiv_version=None, doi="10.1234/test", first_seen="2026-10-28T02:00:00Z", last_updated=None)
     with_arxiv = paper(doi=with_doi.doi, first_seen="2026-10-28T03:00:00Z", last_updated=None)
     same_title_other_id = paper(arxiv_id="2610.50000", first_seen="2026-10-28T04:00:00Z", last_updated=None)
-    result = store.upsert([same_title_other_id, with_arxiv, with_doi, unresolved], day=DAY)
-    assert result.errors == []
-    assert set(store.load()) == {with_arxiv.paper_id, same_title_other_id.paper_id}
-    assert store.load()[with_arxiv.paper_id].first_seen == unresolved.first_seen
+    batch = [with_arxiv, with_doi, unresolved] + ([same_title_other_id] if ambiguous else [])
+    result = store.upsert(batch, day=DAY)
+    assert len(result.errors) == int(ambiguous)
+    expected_ids = {with_arxiv.paper_id} | ({same_title_other_id.paper_id} if ambiguous else set())
+    assert set(store.load()) == expected_ids
+    assert store.load()[with_arxiv.paper_id].first_seen == (with_doi.first_seen if ambiguous else unresolved.first_seen)
     before = snapshot(tmp_path)
-    replay = store.upsert([unresolved, with_doi, with_arxiv, same_title_other_id], day=DAY)
-    assert len(replay.errors) == 1
-    assert replay.errors[0].code == "ambiguous_title"
+    replay = store.upsert(reversed(batch), day=DAY)
+    assert replay == result
+    if ambiguous:
+        assert replay.errors[0].code == "ambiguous_title"
     assert snapshot(tmp_path) == before
 
 

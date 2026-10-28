@@ -1,9 +1,9 @@
 # cmt-paper-feed
 
 Public paper metadata for downstream tools. The implementation follows
-[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 3**:
+[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 4**:
 the uv project, Pydantic v2 data contract, monthly JSONL storage, and the arXiv
-listing/API source, plus offline historical backfill.
+listing/API source, historical backfill, and isolated data-branch workflows.
 
 ## Development
 
@@ -17,6 +17,7 @@ uv run --no-sync pytest
 `test.yml` runs these checks on pull requests and pushes to `main`, on Python
 3.11, 3.12, and 3.13. Tests use synthetic records and temporary directories and
 make no network requests. Installing dependencies requires network access.
+CI also runs SHA-256-pinned actionlint 1.7.12 against all workflow files.
 
 ## arXiv ingestion
 
@@ -26,8 +27,8 @@ uv run feed ingest --data-dir /path/to/data-checkout
 
 `--config` defaults to `config/sources.yml`. By default, ingestion follows the
 current announcement shown on each listing page, regardless of the run date.
-`--date YYYY-MM-DD` is an optional validation check: every page must match that
-date, or ingestion fails before writing. The configured categories are `cond-mat.mes-hall` and
+`--date YYYY-MM-DD` is an optional validation check: mismatching pages produce
+diagnostics without importing their papers. The configured categories are `cond-mat.mes-hall` and
 `cond-mat.supr-con`, as requested for PR 2. The source reads all three sections
 of `https://arxiv.org/list/<category>/new?show=2000`: new submissions,
 cross-listings, and replacements. It retains cross-listings even when the
@@ -46,16 +47,20 @@ merge logic. Replaying unchanged inputs leaves stored bytes unchanged.
 
 On weekends/holidays or a delayed run, `/new` may still show the previous
 announcement. It is ingested again using the page date for both `announced`
-and `daily/<date>.json`; idempotent storage makes repeated runs harmless. Only
-an explicitly empty listing writes an empty manifest for its page date. If
+and `daily/<date>.json`; idempotent storage makes repeated runs harmless. An
+explicitly empty listing writes a no-error empty manifest for its page date. If
 category pages show different dates, records are grouped into separate daily
 files; duplicate IDs use the newer page date. The source returns a `SourceResult`
 containing papers and announcement dates, retaining dates even for empty pages.
 The CLI prints one report, or an `announcements` list for multiple page dates.
 
-Malformed/partial listings, API entries still missing after three attempts,
-and failed requests return a nonzero exit status before any records are written.
-The command prints only counts and structured store conflicts.
+Failures are isolated by source, category and metadata batch. Successful papers
+are stored alongside sanitized diagnostics in `daily/<date>.json.errors`, then
+the CLI returns a nonzero status. No raw exceptions, HTTP bodies, credentials
+or environment dumps are serialized. When every listing fails before its date
+is known, diagnostics use the checked date, or the run's UTC date. Unknown-date
+failures accompany any known announcement dates discovered by other sources.
+The command prints only structured paper counts/dates and errors.
 
 `/new` only exposes the latest announcement, so at least one successful run
 between consecutive announcements is still required. Arbitrary historical
@@ -107,6 +112,42 @@ The [real import report](docs/pr3-validation.md) records 193 source files,
 4253 input rows, **2855 unique arXiv IDs**, seven monthly shards and the SHA-256
 comparison across two imports. The specification's approximately 4200 estimate
 matches the raw row count, not the unique-paper count in this source snapshot.
+
+## GitHub Actions
+
+After merging, run **Historical arXiv backfill** once using `workflow_dispatch`.
+Its date defaults match the historical migration range. It clones only raw
+date-named JSONL from the public legacy data branch, runs `feed backfill`, and
+publishes changed monthly shards. If this repository has no data branch, the
+workflow initializes an orphan data branch with no main history. Repeating an
+unchanged import creates no commit.
+
+**Daily arXiv ingest** runs at UTC 01:30 and also supports `workflow_dispatch`.
+Its optional date input only validates the current announcement. Both workflows
+always check out code from main; data and legacy checkouts and reports live
+under `RUNNER_TEMP`, outside the code workspace. Both share concurrency group
+`cmt-paper-feed-data`, with running jobs never cancelled by another writer.
+Their only declared token permission is `contents: write`.
+
+Only `papers/` and `daily/` changes can be committed. A clean index causes no
+commit or push. Daily commit subjects are `data: YYYY-MM-DD`, or a sorted list
+of announcement dates when pages span multiple days. Historical subjects use
+`data: backfill START..END`. A rejected push is followed by `pull --rebase` and
+another push, with at most three push attempts. A content conflict aborts the
+rebase and fails the job; no force push or automatic content overwrite occurs.
+
+The ingest step may fail while preserving valid papers and diagnostics. Its
+publish step still runs, and a final status step marks the job red afterward.
+Backfill likewise publishes valid changes before reporting any import conflict.
+There is no embedding step.
+
+Business-step reports are redirected to temporary files. Git stdout/stderr is
+captured; token authentication uses process environment rather than repository
+URLs, arguments or persistent Git configuration. No Git identities, raw network
+errors, response bodies, tokens or environment dumps are printed by the scripts.
+
+See [PR 4 validation](docs/pr4-validation.md) for local Git integration checks,
+full-history initialization/replay evidence and the post-merge rollout checks.
 
 ## Data contract and storage
 
@@ -172,10 +213,11 @@ Merge behavior:
   stored records and indexes stay unchanged, and other inputs continue. The
   returned `UpsertResult.errors` contains structured errors with the input
   paper_id, matched IDs, field, sources, and a generic message. Errors describe
-  this invocation only; PR 4 can serialize them into daily errors. Corrupt
+  this invocation only and are persisted in daily errors. Corrupt
   on-disk data and I/O failures still raise exceptions.
 
-`daily/YYYY-MM-DD.json` contains exactly `date`, `new`, and `updated`. IDs are
+`daily/YYYY-MM-DD.json` contains `date`, `new`, `updated`, and the added `errors`
+field. Existing files without errors remain readable. IDs are
 sorted and disjoint. Repeated calls accumulate that day's changes; a record
 added and then updated that day stays in `new`. ID upgrades count as updates
 and replace obsolete IDs in the current day's manifest. Prior dates' manifests
@@ -183,10 +225,16 @@ are historical and remain unchanged. Replaying a batch leaves both the monthly
 shards and current daily manifest byte-identical, including after reopening the
 store. An empty batch writes an empty manifest if none exists.
 
+Errors include the original `identifier_conflict` / `ambiguous_title` objects
+and `source_failure` diagnostics (source, stage, category, announcement date and
+affected paper IDs). They describe the latest attempt; recovery clears old
+errors, and unchanged failures do not append duplicate events. New/updated IDs
+still accumulate within the day. Backfill never reads or writes daily files.
+
 Matching builds indexes once and performs dictionary lookups per input instead
 of scanning and re-normalizing every stored title. Tests bound normalization
 calls by the input/store size, without machine-dependent timing assertions.
 
-The store performs no fuzzy deduplication or metadata resolution. Data-branch
-Git synchronization, daily scheduling, embeddings, indexing, and email access
-belong to subsequent PRs. Backfill never changes the legacy tracker.
+The store performs no fuzzy deduplication or metadata resolution. Embeddings,
+indexing and email access belong to subsequent PRs. Backfill never changes the
+legacy tracker.

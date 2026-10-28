@@ -174,8 +174,11 @@ def test_delayed_run_ingests_current_page_instead_of_skipping_it(tmp_path):
 @pytest.mark.parametrize("checked", [date(2026, 10, 27), date(2026, 10, 31)])
 def test_explicit_date_is_only_a_validation_check(checked):
     adapter, client, _ = source()
-    with client, pytest.raises(SourceError, match="does not match"):
-        adapter.fetch(day=checked, seen_at=SEEN)
+    with client:
+        fetched = adapter.fetch(day=checked, seen_at=SEEN)
+    assert fetched.papers == []
+    assert len(fetched.errors) == 2
+    assert all(error.announced == checked and error.stage == "listing" for error in fetched.errors)
 
 
 @pytest.mark.parametrize("damage", ["container", "date", "entry", "count", "partial"])
@@ -339,7 +342,7 @@ def install_cli_transport(monkeypatch, handler):
 
 
 @pytest.mark.parametrize("kind", ["partial", "empty"])
-def test_incomplete_metadata_after_three_attempts_fails_without_writing(tmp_path, monkeypatch, capsys, kind):
+def test_incomplete_metadata_after_three_attempts_writes_only_diagnostics(tmp_path, monkeypatch, capsys, kind):
     attempts = 0
 
     def handler(request):
@@ -350,16 +353,21 @@ def test_incomplete_metadata_after_three_attempts_fails_without_writing(tmp_path
         return httpx.Response(200, content=incomplete_feed(kind))
 
     adapter, client, calls = source(handler)
-    with client, pytest.raises(SourceError, match="omitted requested entries"):
-        adapter.fetch(seen_at=SEEN)
+    with client:
+        fetched = adapter.fetch(seen_at=SEEN)
+    assert fetched.papers == []
+    assert len(fetched.errors) == 1 and fetched.errors[0].stage == "metadata"
     assert attempts == 3
     assert all(b[0] - a[0] >= 3 for a, b in zip(calls, calls[1:]))
     attempts = 0
     install_cli_transport(monkeypatch, handler)
     assert main(["ingest", "--config", str(CONFIG), "--data-dir", str(tmp_path)]) == 1
     assert attempts == 3
-    assert snapshot(tmp_path) == {}
-    assert "ingest failed" in capsys.readouterr().err
+    assert not (tmp_path / "papers").exists()
+    manifest = json.loads((tmp_path / "daily/2026-10-28.json").read_bytes())
+    assert manifest["new"] == manifest["updated"] == []
+    assert len(manifest["errors"]) == 1
+    assert json.loads(capsys.readouterr().out)["errors"] == manifest["errors"]
 
 
 def test_cli_default_uses_page_date_when_run_days_later(tmp_path, monkeypatch, capsys):
@@ -387,11 +395,13 @@ def test_cli_default_uses_page_date_when_run_days_later(tmp_path, monkeypatch, c
     assert snapshot(tmp_path) == before
 
 
-def test_cli_optional_date_mismatch_writes_nothing(tmp_path, monkeypatch, capsys):
+def test_cli_optional_date_mismatch_writes_only_diagnostics(tmp_path, monkeypatch, capsys):
     install_cli_transport(monkeypatch, replay)
     assert main(["ingest", "--config", str(CONFIG), "--data-dir", str(tmp_path), "--date", "2026-10-31"]) == 1
-    assert snapshot(tmp_path) == {}
-    assert "ingest failed" in capsys.readouterr().err
+    assert not (tmp_path / "papers").exists()
+    manifest = json.loads((tmp_path / "daily/2026-10-31.json").read_bytes())
+    assert len(manifest["errors"]) == 2
+    assert json.loads(capsys.readouterr().out)["errors"] == manifest["errors"]
 
 
 def test_cli_empty_page_uses_page_date_for_empty_manifest(tmp_path, monkeypatch, capsys):
@@ -402,7 +412,7 @@ def test_cli_empty_page_uses_page_date_for_empty_manifest(tmp_path, monkeypatch,
     install_cli_transport(monkeypatch, handler)
     assert main(["ingest", "--config", str(CONFIG), "--data-dir", str(tmp_path)]) == 0
     assert json.loads((tmp_path / "daily/2026-10-28.json").read_bytes()) == {
-        "date": "2026-10-28", "new": [], "updated": [],
+        "date": "2026-10-28", "new": [], "updated": [], "errors": [],
     }
 
 
@@ -447,10 +457,80 @@ def test_cli_ingest_replays_recordings_without_network(tmp_path, monkeypatch, ca
     args = ["ingest", "--config", str(CONFIG), "--data-dir", str(tmp_path), "--date", DAY.isoformat()]
     assert main(args) == (1 if failure else 0)
     if failure:
-        assert snapshot(tmp_path) == {}
-        assert "ingest failed" in capsys.readouterr().err
+        assert not (tmp_path / "papers").exists()
+        report = json.loads(capsys.readouterr().out)
+        assert report["errors"]
+        manifest = json.loads((tmp_path / "daily" / f"{report['date']}.json").read_bytes())
+        assert manifest["errors"] == report["errors"]
     else:
         assert json.loads(capsys.readouterr().out)["fetched"] == 53
         before = snapshot(tmp_path)
         assert main(args) == 0
         assert snapshot(tmp_path) == before
+
+
+def test_failed_category_still_ingests_successful_category(tmp_path, monkeypatch, capsys):
+    def handler(request):
+        if request.url.host == "arxiv.org":
+            if CATEGORIES[0] in request.url.path:
+                return httpx.Response(503, text="private upstream response")
+            return replay(request)
+        requested = set(request.url.params["id_list"].split(","))
+        root = ET.fromstring(recording("api-000.xml"))
+        for entry in root.findall("atom:entry", NS):
+            key = entry.findtext("atom:id", namespaces=NS).split("/abs/")[1].rsplit("v", 1)[0]
+            if key not in requested:
+                root.remove(entry)
+        return httpx.Response(200, content=ET.tostring(root))
+
+    install_cli_transport(monkeypatch, handler)
+    args = ["ingest", "--config", str(CONFIG), "--data-dir", str(tmp_path)]
+    assert main(args) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["date"] == DAY.isoformat() and report["fetched"] == 17
+    assert len(PaperStore(tmp_path).load()) == 17
+    daily = json.loads((tmp_path / "daily/2026-10-28.json").read_bytes())
+    assert len(daily["new"]) == 17
+    assert daily["errors"][0]["category"] == CATEGORIES[0]
+    assert "private upstream response" not in json.dumps(daily)
+    before = snapshot(tmp_path)
+    assert main(args) == 1
+    assert snapshot(tmp_path) == before
+
+
+def test_failed_metadata_batch_keeps_other_batches(tmp_path):
+    ids = [f"2610.{i:05d}" for i in range(201)]
+    template, _ = api_fixture()
+    original = template.find("atom:entry", NS)
+
+    def handler(request):
+        if request.url.host == "arxiv.org":
+            return httpx.Response(200, text=synthetic_listing(ids))
+        batch = request.url.params["id_list"].split(",")
+        feed = ET.Element(f"{{{NS['atom']}}}feed")
+        if batch[0] != "2610.00100":
+            for key in batch:
+                entry = copy.deepcopy(original)
+                entry.find("atom:id", NS).text = f"http://arxiv.org/abs/{key}v1"
+                feed.append(entry)
+        return httpx.Response(200, content=ET.tostring(feed))
+
+    adapter, client, calls = source(handler, categories=CATEGORIES[:1])
+    with client:
+        fetched = adapter.fetch(seen_at=SEEN)
+    assert len(fetched.papers) == 101
+    assert len(fetched.errors) == 1
+    assert len(fetched.errors[0].paper_ids) == 100
+    assert all(b[0] - a[0] >= 3 for a, b in zip(calls, calls[1:]))
+    result = PaperStore(tmp_path).upsert(fetched.papers, day=DAY, source_errors=fetched.errors)
+    assert len(result.new) == 101
+    assert len(json.loads((tmp_path / "daily/2026-10-28.json").read_bytes())["errors"]) == 1
+
+
+def test_source_initialization_failure_is_recorded_without_raw_details(tmp_path, capsys):
+    assert main(["ingest", "--config", str(tmp_path / "missing.yml"),
+                 "--data-dir", str(tmp_path / "data"), "--date", DAY.isoformat()]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["errors"][0]["stage"] == "source"
+    assert "missing.yml" not in json.dumps(report)
+    assert json.loads((tmp_path / "data/daily/2026-10-28.json").read_bytes())["errors"] == report["errors"]
