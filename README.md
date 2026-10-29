@@ -1,9 +1,10 @@
 # cmt-paper-feed
 
 Public paper metadata for downstream tools. The implementation follows
-[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 4**:
+[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 5**:
 the uv project, Pydantic v2 data contract, monthly JSONL storage, and the arXiv
-listing/API source, historical backfill, and isolated data-branch workflows.
+listing/API source, historical backfill, isolated data-branch workflows,
+incremental CPU document vectors and rebuildable local full-text search.
 
 ## Development
 
@@ -18,11 +19,15 @@ uv run --no-sync pytest
 3.11, 3.12, and 3.13. Tests use synthetic records and temporary directories and
 make no network requests. Installing dependencies requires network access.
 CI also runs SHA-256-pinned actionlint 1.7.12 against all workflow files.
+The development group includes NumPy/PyArrow for fake-vector tests; it does not
+install torch or download a model. Production ingest uses `--no-dev` and installs
+none of the vector dependencies. Real-model smoke tests are skipped by default.
 
 ## arXiv ingestion
 
 ```sh
-uv run feed ingest --data-dir /path/to/data-checkout
+uv sync --locked --no-dev
+uv run --no-sync feed ingest --data-dir /path/to/data-checkout
 ```
 
 `--config` defaults to `config/sources.yml`. By default, ingestion follows the
@@ -80,7 +85,7 @@ directory and a separate destination data checkout:
 
 ```sh
 git clone --depth 1 --single-branch --branch data https://github.com/topomat12138/daily-arXiv-ai-enhanced.git /tmp/legacy-arxiv
-uv run feed backfill --source-dir /tmp/legacy-arxiv --data-dir /path/to/data-checkout
+uv run --no-sync feed backfill --source-dir /tmp/legacy-arxiv --data-dir /path/to/data-checkout
 ```
 
 The default inclusive range is 2026-04-11 through 2026-10-27; override it with
@@ -113,6 +118,73 @@ The [real import report](docs/pr3-validation.md) records 193 source files,
 comparison across two imports. The specification's approximately 4200 estimate
 matches the raw row count, not the unique-paper count in this source snapshot.
 
+## Document embeddings
+
+```sh
+uv sync --locked --no-dev --extra embed
+uv run --no-sync feed embed --data-dir /path/to/data-checkout
+```
+
+`--config` defaults to `config/sources.yml`. Its public `embedding` section pins
+`jinaai/jina-embeddings-v5-text-nano` to commit
+`8a7f00aac812071b69403df470f1038ec85f8925`, with `task: retrieval`,
+`prompt_name: document` and batch size 8. A revision must be a full commit hash;
+changing models requires pinning that model's commit too. Only the document or
+passage side is accepted. The model identifier is
+`<model>@<revision>|task=<task>|prompt=<prompt_name>`.
+
+The model runs locally on CPU with float32 inference and outputs 768 dimensions.
+All model code, weights, adapters and tokenizer are downloaded as one pinned
+snapshot, then loaded from its local path; nested upstream loaders cannot fall
+back to the model's mutable main branch. No model weights belong in Git. The
+Linux/Windows torch dependency uses uv's explicit `pytorch-cpu` index; macOS uses
+its CPU-capable PyPI wheel and is also forced to CPU. No CUDA packages are locked.
+
+Text is `title.strip() + "\n\n" + (abstract or "").strip()`. Its `text_hash` is
+SHA-256 of the model identifier, a newline, then that text. Missing or changed
+hashes are computed; unchanged records do not load a model or recompute. Each
+vector is L2-normalized before conversion to float16. Parquet rows are sorted
+by paper_id and contain exactly paper_id, model, text_hash and a fixed-size
+float16 vector list.
+
+The path `embeddings/YYYY/YYYY-MM.parquet` mirrors each paper shard's first_seen
+month. Changed contents replace a shard atomically; unchanged shards retain
+their exact bytes and modification time. ID upgrades and month moves can reuse
+vectors without inference. Obsolete rows/shards are removed. Inference and
+serialization finish before any vector shard is written, and paper JSONL/daily
+files are never modified by embedding. Reports contain new/updated/skipped
+counts, elapsed_seconds, model identifier, dimension and actual computed count;
+failures produce safe JSON plus readable stderr.
+
+## Local full-text search
+
+```sh
+uv run --no-sync feed index --data-dir /path/to/data-checkout --out /tmp/papers.sqlite3
+uv run --no-sync feed search "Shiba chain" --index /tmp/papers.sqlite3 --data-dir /path/to/data-checkout
+uv run --no-sync feed search 'title:Shiba OR authors:Moller' --raw --index /tmp/papers.sqlite3
+```
+
+Index/search require only the standard runtime, with SQLite FTS5 support; no
+model or vector dependencies are imported. Indexing removes the previous local
+SQLite file and rebuilds from all JSONL records. FTS columns are title, abstract
+and authors joined by `; `; a regular table retains paper_id, announced,
+first_seen, primary_category, abs link and original display metadata. SQLite
+files and their sidecars are ignored by Git and are never published.
+
+Search creates a missing index and orders results by bm25, with paper_id as a
+stable tie breaker. JSON results show paper_id, title, the first three authors,
+announced and abs. The default limit is 20; override it with `--limit`. Without
+`--data-dir`, search uses `data-checkout`; without `--index`, it uses
+`<data-dir>/index.sqlite3`. Rebuild explicitly after paper data changes.
+
+Queries are literal text by default: tokenize into words and quote each word
+before using FTS5, so hyphens, plus signs, quotes and parentheses cannot become
+query syntax. `--raw` explicitly enables advanced FTS5 syntax. The tokenizer is
+`unicode61 remove_diacritics 2`. SQLite does not decompose ø, so both indexed
+search text and queries additionally fold ø/Ø to o/O; displayed metadata keeps
+the original spelling. This enables Moller to find Møller. Search is full-text
+only; vector retrieval belongs to Layer 2.
+
 ## GitHub Actions
 
 After merging, run **Historical arXiv backfill** once using `workflow_dispatch`.
@@ -129,7 +201,8 @@ under `RUNNER_TEMP`, outside the code workspace. Both share concurrency group
 `cmt-paper-feed-data`, with running jobs never cancelled by another writer.
 Their only declared token permission is `contents: write`.
 
-Only `papers/` and `daily/` changes can be committed. A clean index causes no
+Paper publication allows only `papers/` and `daily/`; embedding publication
+allows only `embeddings/`. A clean Git index causes no
 commit or push. Daily commit subjects are `data: YYYY-MM-DD`, or a sorted list
 of announcement dates when pages span multiple days. Historical subjects use
 `data: backfill START..END`. A rejected push is followed by `pull --rebase` and
@@ -139,7 +212,19 @@ rebase and fails the job; no force push or automatic content overwrite occurs.
 The ingest step may fail while preserving valid papers and diagnostics. Its
 publish step still runs, and a final status step marks the job red afterward.
 Backfill likewise publishes valid changes before reporting any import conflict.
-There is no embedding step.
+Embedding runs in the independent **Paper embeddings** workflow after either
+paper workflow completes, including partial failures, or by workflow_dispatch.
+It executes trusted main code, uses the same concurrency group and only
+`contents: write` permission, and has a 60-minute limit for the initial historical
+calculation. A failed vector calculation cannot undo paper publication.
+
+HF_HOME is a runner temporary directory cached with a key containing the model
+name and fixed revision. The workflow installs only the optional CPU runtime,
+processes every missing/changed hash, shows its JSON report in the step summary,
+and commits only changed vector shards as `data: embeddings <new+updated>`.
+An unchanged rerun produces no commit. The daily incremental target is under
+10 minutes; measured local timings and the remaining Actions check are recorded
+in [PR 5 validation](docs/pr5-validation.md).
 
 Business-step JSON reports are saved in temporary files and copied to the
 Actions step summary, including counts and errors even when ingestion fails.

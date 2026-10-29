@@ -3,3 +3,10 @@ sources:
     categories:
       - cond-mat.mes-hall
       - cond-mat.supr-con
+
+embedding:
+  model: jinaai/jina-embeddings-v5-text-nano
+  revision: 8a7f00aac812071b69403df470f1038ec85f8925
+  task: retrieval
+  prompt_name: document
+  batch_size: 8

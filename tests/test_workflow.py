@@ -212,6 +212,52 @@ def test_pre_staged_non_data_is_never_committed(remote, tmp_path, paper):
     assert git(remote, "rev-parse", "data") == previous
 
 
+def test_embed_publication_only_commits_embeddings_and_unchanged_clone_has_no_commit(remote, tmp_path, paper):
+    root = seeded_checkout(remote, tmp_path, paper)
+    main_before = git(remote, "rev-parse", "main")
+    papers_before = git(remote, "show", "data:papers/2026/2026-10.jsonl")
+    daily_before = git(remote, "show", "data:daily/2026-10-28.json")
+    shard = root / "embeddings/2026/2026-10.parquet"
+    shard.parent.mkdir(parents=True)
+    shard.write_bytes(b"synthetic deterministic embedding shard")
+    # A dirty paper/daily tree must never enter an embeddings commit.
+    (root / "papers/2026/2026-10.jsonl").write_text("not for publication")
+    (root / "daily/2026-10-28.json").write_text("not for publication")
+    (root / "unrelated.txt").write_text("not for publication")
+    path = report(tmp_path, {"new": 3, "updated": 2, "skipped": 7})
+    assert workflow.main(["publish", "--directory", str(root), "--report", str(path), "--kind", "embed"]) == 0
+    assert git(remote, "log", "-1", "--format=%s", "data") == "data: embeddings 5"
+    assert git(remote, "diff", "--name-only", "data~1", "data") == "embeddings/2026/2026-10.parquet"
+    assert git(remote, "show", "data:papers/2026/2026-10.jsonl") == papers_before
+    assert git(remote, "show", "data:daily/2026-10-28.json") == daily_before
+    previous = git(remote, "rev-parse", "data")
+    again = tmp_path / "embedding-again"
+    workflow.checkout_data(str(remote), again)
+    assert (again / "embeddings/2026/2026-10.parquet").read_bytes() == shard.read_bytes()
+    assert not workflow.publish_data(again, report_path=path, kind="embed")
+    assert git(remote, "rev-parse", "data") == previous
+    assert git(remote, "rev-list", "--count", "data") == "2"
+    assert git(remote, "rev-parse", "main") == main_before
+
+
+@pytest.mark.parametrize("area", ["papers/2026/2026-10.jsonl", "daily/2026-10-28.json", "unrelated.txt"])
+def test_embed_publication_rejects_pre_staged_non_embedding_paths(remote, tmp_path, paper, area):
+    root = seeded_checkout(remote, tmp_path, paper)
+    previous = git(remote, "rev-parse", "data")
+    path = root / area
+    path.write_text("not an embedding")
+    git(root, "add", "--", area)
+    with pytest.raises(workflow.WorkflowError, match="non-data"):
+        workflow.publish_data(root, report_path=report(tmp_path, {"new": 1, "updated": 0}), kind="embed")
+    assert git(remote, "rev-parse", "data") == previous
+
+
+@pytest.mark.parametrize("count", [-1, True, "1", None])
+def test_embed_commit_message_rejects_invalid_counts(tmp_path, count):
+    with pytest.raises(workflow.WorkflowError, match="nonnegative"):
+        workflow.commit_message(report(tmp_path, {"new": count, "updated": 0}), "embed")
+
+
 def test_checkout_rejects_paths_inside_code_workspace(remote, tmp_path, monkeypatch):
     workspace = tmp_path / "code"
     workspace.mkdir()
@@ -388,7 +434,46 @@ def test_workflows_share_lock_have_minimal_permissions_and_publish_before_failin
         assert steps.index(operation) < steps.index(summary) < steps.index(publish)
 
 
-@pytest.mark.parametrize("name", ["ingest", "backfill"])
+def test_embed_workflow_is_independent_uses_shared_lock_cpu_runtime_and_pinned_model_cache():
+    data = yaml.load((ROOT / ".github/workflows/embed.yml").read_text(), Loader=yaml.BaseLoader)
+    ingest = yaml.load((ROOT / ".github/workflows/ingest.yml").read_text(), Loader=yaml.BaseLoader)
+    assert set(data["on"]) == {"workflow_run", "workflow_dispatch"}
+    assert data["on"]["workflow_run"] == {
+        "workflows": ["Daily arXiv ingest", "Historical arXiv backfill"],
+        "types": ["completed"], "branches": ["main"],
+    }
+    assert data["permissions"] == {"contents": "write"}
+    assert data["concurrency"] == ingest["concurrency"]
+    job = data["jobs"]["embed"]
+    assert job["timeout-minutes"] == "60"
+    assert "head_repository.full_name == github.repository" in job["if"]
+    assert "head_branch == 'main'" in job["if"]
+    assert "conclusion" not in job["if"]  # Failed ingestion may have published valid papers.
+    steps = job["steps"]
+    assert steps[0]["with"] == {"ref": "main", "persist-credentials": "false"}
+    install = next(step["run"] for step in steps if "uv sync" in step.get("run", ""))
+    assert "--locked --no-dev --extra embed" in install
+    temporary_cache = next(step["run"] for step in steps if "HF_HOME=" in step.get("run", ""))
+    assert "$RUNNER_TEMP" in temporary_cache and "$GITHUB_ENV" in temporary_cache
+    cache = next(step for step in steps if step.get("uses", "").startswith("actions/cache@"))
+    assert len(cache["uses"].split("@", 1)[1]) == 40
+    assert cache["with"]["path"] == "${{ env.HF_HOME }}"
+    assert "steps.model.outputs.name" in cache["with"]["key"]
+    assert "steps.model.outputs.revision" in cache["with"]["key"]
+    operation = next(step for step in steps if step.get("id") == "embed")
+    assert "feed embed --data-dir" in operation["run"]
+    assert operation["continue-on-error"] == "true"
+    summary = next(step for step in steps if "$GITHUB_STEP_SUMMARY" in step.get("run", ""))
+    assert "steps.embed.outcome == 'failure'" in summary["if"]
+    publish = next(step for step in steps if "feed.workflow publish" in step.get("run", ""))
+    assert "--kind embed" in publish["run"]
+    assert "steps.embed.outcome == 'success'" in publish["if"]
+    assert steps.index(operation) < steps.index(summary) < steps.index(publish)
+    assert "steps.embed.outcome == 'failure'" in steps[-1]["if"]
+    assert steps[-1]["run"] == "exit 1"
+
+
+@pytest.mark.parametrize("name", ["ingest", "backfill", "embed"])
 @pytest.mark.parametrize("has_report", [True, False])
 def test_workflow_summary_shows_report_or_missing_report_diagnostic(tmp_path, name, has_report):
     workflow_yaml = yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(), Loader=yaml.BaseLoader)
