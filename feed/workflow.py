@@ -125,6 +125,11 @@ def checkout_legacy(directory: str | Path) -> None:
 
 def commit_message(report_path: str | Path, kind: str) -> str:
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    if kind == "embed":
+        counts = [report.get(key) for key in ("new", "updated")]
+        if any(type(count) is not int or count < 0 for count in counts):
+            raise WorkflowError("embedding report requires nonnegative new and updated counts")
+        return f"data: embeddings {sum(counts)}"
     if kind == "backfill":
         first = date.fromisoformat(report["first_file_date"])
         last = date.fromisoformat(report["last_file_date"])
@@ -138,6 +143,11 @@ def commit_message(report_path: str | Path, kind: str) -> str:
 
 def publish_data(directory: str | Path, *, report_path: str | Path, kind: str,
                  token: str | None = None) -> bool:
+    allowed = {"ingest": {"papers", "daily"}, "backfill": {"papers", "daily"},
+               "embed": {"embeddings"}}
+    if kind not in allowed:
+        raise WorkflowError("unknown data publication kind")
+    areas = allowed[kind]
     root = Path(directory).resolve()
     env = git_environment(token)
     if run_git(root, "rev-parse", "--show-toplevel", env=env).stdout.strip() != str(root):
@@ -145,7 +155,7 @@ def publish_data(directory: str | Path, *, report_path: str | Path, kind: str,
     if run_git(root, "symbolic-ref", "--short", "HEAD", env=env).stdout.strip() != "data":
         raise WorkflowError("refusing to publish a code branch")
     safe_repository(run_git(root, "remote", "get-url", "origin", env=env).stdout.strip())
-    for area in ("papers", "daily"):
+    for area in sorted(areas):
         if (root / area).exists() or run_git(root, "ls-files", "--", area, env=env).stdout:
             run_git(root, "add", "--all", "--", area, env=env)
     changed = run_git(root, "diff", "--cached", "--quiet", env=env, check=False)
@@ -154,7 +164,7 @@ def publish_data(directory: str | Path, *, report_path: str | Path, kind: str,
     if changed.returncode != 1:
         raise git_error("cannot inspect data changes", changed, env)
     staged = run_git(root, "diff", "--cached", "--name-only", "-z", env=env).stdout.split("\0")
-    if any(path and path.split("/", 1)[0] not in {"papers", "daily"} for path in staged):
+    if any(path and path.split("/", 1)[0] not in areas for path in staged):
         raise WorkflowError("refusing non-data changes")
     run_git(root, "commit", "--quiet", "-m", commit_message(report_path, kind), env=env)
     for attempt in range(3):
@@ -184,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     publish = sub.add_parser("publish")
     publish.add_argument("--directory", type=Path, required=True)
     publish.add_argument("--report", type=Path, required=True)
-    publish.add_argument("--kind", choices=["ingest", "backfill"], required=True)
+    publish.add_argument("--kind", choices=["ingest", "backfill", "embed"], required=True)
     args = parser.parse_args(argv)
     token = os.environ.get("FEED_GITHUB_TOKEN")
     try:

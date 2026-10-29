@@ -1,0 +1,81 @@
+name: Paper embeddings
+
+on:
+  workflow_run:
+    workflows: [Daily arXiv ingest, Historical arXiv backfill]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cmt-paper-feed-data
+  cancel-in-progress: false
+
+jobs:
+  embed:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.head_repository.full_name == github.repository && github.event.workflow_run.head_branch == 'main') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '0.13.6'
+          python-version: '3.12'
+          enable-cache: true
+      - name: Configure temporary model cache
+        run: printf 'HF_HOME=%s/huggingface\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Install locked CPU embedding runtime
+        run: uv sync --locked --no-dev --extra embed
+      - name: Read pinned model cache identity
+        id: model
+        run: |
+          uv run --no-sync python - <<'PY' >> "$GITHUB_OUTPUT"
+          from feed.config import load_config
+          options = load_config("config/sources.yml").embedding
+          print("name=" + options.model.replace("/", "-"))
+          print("revision=" + options.revision)
+          PY
+      - name: Cache pinned model files
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.HF_HOME }}
+          key: ${{ runner.os }}-hf-${{ steps.model.outputs.name }}-${{ steps.model.outputs.revision }}
+      - name: Prepare isolated data checkout
+        env:
+          FEED_GITHUB_TOKEN: ${{ github.token }}
+        run: uv run --no-sync python -m feed.workflow checkout --directory "$RUNNER_TEMP/feed-data"
+      - name: Compute missing or changed embeddings
+        id: embed
+        continue-on-error: true
+        run: uv run --no-sync feed embed --data-dir "$RUNNER_TEMP/feed-data" > "$RUNNER_TEMP/feed-embed.json"
+      - name: Summarize embedding calculation
+        if: ${{ !cancelled() && (steps.embed.outcome == 'success' || steps.embed.outcome == 'failure') }}
+        run: |
+          {
+            printf '### Embedding report\n\n'
+            if [[ -s "$RUNNER_TEMP/feed-embed.json" ]]; then
+              printf '```json\n'
+              cat "$RUNNER_TEMP/feed-embed.json"
+              printf '\n```\n'
+            else
+              printf 'No JSON report was produced. See step errors above.\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish changed embedding shards
+        if: ${{ !cancelled() && steps.embed.outcome == 'success' }}
+        env:
+          FEED_GITHUB_TOKEN: ${{ github.token }}
+        run: uv run --no-sync python -m feed.workflow publish --directory "$RUNNER_TEMP/feed-data" --report "$RUNNER_TEMP/feed-embed.json" --kind embed
+      - name: Mark incomplete embedding calculation as failed
+        if: ${{ !cancelled() && steps.embed.outcome == 'failure' }}
+        run: exit 1
