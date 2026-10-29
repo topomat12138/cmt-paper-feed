@@ -1,9 +1,11 @@
 import json
+import os
 import sqlite3
 from datetime import date
 
 import pytest
 
+import feed.build_index as indexing
 from feed.build_index import SearchIndexError, build_index, plain_query, search
 from feed.store import PaperStore
 
@@ -28,7 +30,7 @@ def test_index_builds_metadata_and_rebuild_discards_old_tables(tmp_path, paper):
         row = connection.execute("SELECT paper_id, authors, announced, first_seen, primary_category, abs FROM papers").fetchone()
         assert row == (record.paper_id, "; ".join(record.authors), "2026-10-27", "2026-10-28T01:30:00+00:00",
                        "cond-mat.supr-con", record.links["abs"])
-        assert "unicode61 remove_diacritics 2" in connection.execute(
+        assert "porter unicode61 remove_diacritics 2" in connection.execute(
             "SELECT sql FROM sqlite_master WHERE name='papers_fts'").fetchone()[0]
         connection.execute("CREATE TABLE stale (value TEXT)")
     build_index(data, out)
@@ -116,6 +118,99 @@ def test_rebuild_uses_current_jsonl_records(tmp_path, paper):
     build_index(data, out)
     assert search("replacement", index=out, data_dir=data)[0]["title"] == "A replacement title"
     assert search("Bi2Se3", index=out, data_dir=data) == []
+
+
+@pytest.mark.parametrize("query", ["Majorana zero mode", "superconductor"])
+def test_singular_queries_match_plural_text(tmp_path, paper, query):
+    record = paper(title="Majorana zero modes in superconductors")
+    data = tmp_path / "data"
+    PaperStore(data).upsert([record], day=DAY)
+    assert search(query, index=tmp_path / "index.sqlite3", data_dir=data)[0]["paper_id"] == record.paper_id
+
+
+@pytest.mark.parametrize("first_seen", ["2026-10-28T00:00:00Z", "2026-11-01T00:00:00Z"])
+def test_search_rebuilds_after_paper_added_in_existing_or_new_shard(tmp_path, paper, first_seen):
+    data, _ = seed(tmp_path, paper)
+    index = tmp_path / "search.sqlite3"
+    build_index(data, index)
+    added = paper(arxiv_id="2610.99999", title="Newly added discovery", first_seen=first_seen,
+                  last_updated=first_seen)
+    PaperStore(data).upsert([added], day=DAY)
+    assert search("newly added", index=index, data_dir=data)[0]["paper_id"] == added.paper_id
+
+
+def test_search_detects_content_change_even_when_size_and_mtime_match(tmp_path, paper):
+    data, record = seed(tmp_path, paper)
+    index = tmp_path / "search.sqlite3"
+    build_index(data, index)
+    path = data / "papers/2026/2026-10.jsonl"
+    original = path.stat()
+    before = path.read_bytes()
+    after = before.replace(b"Bi2Se3", b"Nb2Se3")
+    assert after != before and len(after) == len(before)
+    path.write_bytes(after)
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    assert search("Nb2Se3", index=index, data_dir=data)[0]["paper_id"] == record.paper_id
+    assert search("Bi2Se3", index=index, data_dir=data) == []
+
+
+def test_search_removes_deleted_papers_automatically(tmp_path, paper):
+    data, _ = seed(tmp_path, paper)
+    index = tmp_path / "search.sqlite3"
+    build_index(data, index)
+    (data / "papers/2026/2026-10.jsonl").unlink()
+    assert search("Shiba", index=index, data_dir=data) == []
+
+
+def test_unchanged_paper_bytes_do_not_rebuild_index(tmp_path, paper, monkeypatch):
+    data, _ = seed(tmp_path, paper)
+    index = tmp_path / "search.sqlite3"
+    build_index(data, index)
+    before = index.read_bytes()
+    modified = index.stat().st_mtime_ns
+    shard = data / "papers/2026/2026-10.jsonl"
+    stat = shard.stat()
+    os.utime(shard, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unchanged source contents must not rebuild the index")
+
+    monkeypatch.setattr(indexing, "build_index", forbidden)
+    assert search("Shiba", index=index, data_dir=data)
+    assert index.read_bytes() == before and index.stat().st_mtime_ns == modified
+
+
+@pytest.mark.parametrize("legacy", ["missing_meta", "old_version"])
+def test_search_refreshes_indexes_without_current_metadata(tmp_path, paper, legacy):
+    data, _ = seed(tmp_path, paper)
+    index = tmp_path / "search.sqlite3"
+    build_index(data, index)
+    with sqlite3.connect(index) as connection:
+        if legacy == "missing_meta":
+            connection.execute("DROP TABLE meta")
+        else:
+            connection.execute("UPDATE meta SET value = 'old' WHERE key = 'version'")
+        connection.execute("DELETE FROM papers_fts")
+    assert search("Shiba", index=index, data_dir=data)
+
+
+def test_mid_read_source_change_does_not_publish_incorrect_fingerprint(tmp_path, paper, monkeypatch):
+    data, _ = seed(tmp_path, paper)
+    index = tmp_path / "search.sqlite3"
+    build_index(data, index)
+    before = index.read_bytes()
+    original = PaperStore.load
+
+    def concurrent_update(self):
+        papers = original(self)
+        path = data / "papers/2026/2026-10.jsonl"
+        path.write_bytes(path.read_bytes().replace(b"Bi2Se3", b"Nb2Se3"))
+        return papers
+
+    monkeypatch.setattr(PaperStore, "load", concurrent_update)
+    with pytest.raises(SearchIndexError, match="changed while indexing"):
+        build_index(data, index)
+    assert index.read_bytes() == before
 
 
 @pytest.mark.parametrize("operation", ["build", "search"])

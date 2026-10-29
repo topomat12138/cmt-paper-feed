@@ -114,6 +114,10 @@ def test_index_and_search_cli_default_local_index_limit_and_raw(tmp_path, paper,
     assert json.loads(capsys.readouterr().out)["records"] == 3
     assert cli.main(["search", 'title:Bi2Se3', "--raw", "--index", str(index), "--limit", "1"]) == 0
     assert len(json.loads(capsys.readouterr().out)) == 1
+    added = paper(arxiv_id="2610.99999", title="Automatically refreshed discovery")
+    PaperStore(data).upsert([added], day=date(2026, 10, 28), write_daily=False)
+    assert cli.main(["search", "refreshed discovery", "--index", str(index)]) == 0
+    assert json.loads(capsys.readouterr().out)[0]["paper_id"] == added.paper_id
     assert cli.main(["search", 'title:(', "--raw", "--index", str(index)]) == 1
     assert "invalid FTS5 query" in capsys.readouterr().err
 

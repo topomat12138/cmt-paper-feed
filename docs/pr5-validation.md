@@ -6,7 +6,7 @@ Implements PR 5 of spec-layer1.md and the owner's detailed embedding/index
 requirements on top of main `777d1af5914ab66c9cf1d8508cee26e178efd726`.
 No Scholar/Layer 2 retrieval or generated paper metadata is added.
 
-- 236 offline tests pass; one opt-in real-model smoke test is skipped by default.
+- 246 offline tests pass; one opt-in real-model smoke test is skipped by default.
   The suite's socket guard remains enabled and no test downloads a model.
 - Fake vectors are generated deterministically from text hashes. Tests cover
   unchanged hashes, one replacement abstract, changed model revision, float16
@@ -23,6 +23,13 @@ No Scholar/Layer 2 retrieval or generated paper metadata is added.
 - FTS5 tests cover a clean rebuild, missing-index generation, bm25/limit,
   original metadata, literal Yu-Shiba-Rusinov/p+ip/Bi2Se3/quotes/parentheses,
   Moller/Møller and other diacritics, explicit raw syntax and safe errors.
+- Following Claude's review, the tokenizer is porter unicode61
+  remove_diacritics 2. Singular searches match plural text. An index meta table
+  stores its format version and all source JSONL relative paths/content hashes.
+  Search refreshes after added/modified/deleted papers, detects content changes
+  even at unchanged size/mtime, and preserves an unchanged index despite mtime
+  changes. Older formats refresh automatically. A mid-read source change fails
+  clearly without replacing the index with an inconsistent fingerprint.
 - CLI tests cover JSON reports, failed-run summaries with no raw credentials,
   lazy imports and independent ingest despite invalid vector configuration.
 - actionlint 1.7.12 passes all workflows. Wheel and source distribution build.
@@ -110,6 +117,11 @@ The full-text index was rebuilt from all 2898 records. A manual literal Moller
 query returned a record containing author Martin Møller Greve, retaining the
 original spelling in the JSON result.
 
+After the review changes, searching the existing pre-metadata index rebuilt it
+automatically. Majorana zero mode and Majorana zero modes returned the same
+48 paper IDs; superconductor and superconductors returned the same 530 IDs.
+A subsequent search without source changes left the SQLite bytes unchanged.
+
 ## Approved changes and implementation details
 
 - Vector paths use embeddings/YYYY/YYYY-MM.parquet, as explicitly approved,
@@ -123,6 +135,8 @@ original spelling in the JSON result.
   settings are rejected. Model code, weights and adapters all use the same SHA.
 - unicode61 remove_diacritics 2 does not fold ø; searchable text and queries
   additionally fold ø/Ø to o/O. Display fields keep original metadata.
+- Claude's review adds the Porter wrapper for singular/plural matching and
+  source content fingerprints for automatic index freshness checks.
 - SQLite contains additional original display fields beside the requested
   metadata columns; it is local derived data and excluded from publication.
 

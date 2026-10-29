@@ -6,6 +6,7 @@ published to the data branch. Search results retain the original metadata.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -13,6 +14,8 @@ import unicodedata
 from pathlib import Path
 
 from feed.store import PaperStore
+
+INDEX_VERSION = "porter-1"
 
 
 class SearchIndexError(ValueError):
@@ -46,10 +49,36 @@ def _output_path(data_dir: str | Path, out: str | Path) -> Path:
     return path
 
 
+def _papers_fingerprint(data_dir: str | Path) -> str:
+    root = Path(data_dir)
+    entries = [(path.relative_to(root).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest())
+               for path in sorted((root / "papers").glob("*/*.jsonl"))]
+    return json.dumps(entries, separators=(",", ":"))
+
+
+def _index_is_current(path: Path, fingerprint: str) -> bool:
+    if not path.exists():
+        return False
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            metadata = dict(connection.execute("SELECT key, value FROM meta"))
+            return (metadata.get("version") == INDEX_VERSION
+                    and metadata.get("papers_fingerprint") == fingerprint)
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        # Old or invalid derived indexes are regenerated from the source JSONL.
+        return False
+
+
 def build_index(data_dir: str | Path, out: str | Path) -> dict:
     """Delete an old local index and rebuild FTS5 plus original metadata."""
     path = _output_path(data_dir, out)
+    fingerprint = _papers_fingerprint(data_dir)
     papers = PaperStore(data_dir).load()
+    if _papers_fingerprint(data_dir) != fingerprint:
+        raise SearchIndexError("paper storage changed while indexing; retry with a stable data checkout")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)
     for suffix in ("-wal", "-shm", "-journal"):
@@ -60,6 +89,9 @@ def build_index(data_dir: str | Path, out: str | Path) -> dict:
         raise SearchIndexError("cannot create SQLite index; check output storage") from None
     try:
         with connection:
+            connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
+                                   [("version", INDEX_VERSION), ("papers_fingerprint", fingerprint)])
             connection.execute("""CREATE TABLE papers (
                 paper_id TEXT NOT NULL UNIQUE,
                 title TEXT NOT NULL,
@@ -73,7 +105,7 @@ def build_index(data_dir: str | Path, out: str | Path) -> dict:
             )""")
             connection.execute("""CREATE VIRTUAL TABLE papers_fts USING fts5(
                 title, abstract, authors,
-                tokenize = 'unicode61 remove_diacritics 2'
+                tokenize = 'porter unicode61 remove_diacritics 2'
             )""")
             for rowid, paper in enumerate(sorted(papers.values(), key=lambda p: p.paper_id), 1):
                 authors = "; ".join(paper.authors)
@@ -106,7 +138,7 @@ def search(query: str, *, index: str | Path, data_dir: str | Path,
     if type(limit) is not int or limit < 1:
         raise SearchIndexError("search limit must be a positive integer")
     path = _output_path(data_dir, index)
-    if not path.exists():
+    if not _index_is_current(path, _papers_fingerprint(data_dir)):
         build_index(data_dir, path)
     expression = _search_text(query).strip() if raw else plain_query(query)
     if not expression:

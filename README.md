@@ -171,16 +171,21 @@ and authors joined by `; `; a regular table retains paper_id, announced,
 first_seen, primary_category, abs link and original display metadata. SQLite
 files and their sidecars are ignored by Git and are never published.
 
-Search creates a missing index and orders results by bm25, with paper_id as a
+Search creates a missing or stale index and orders results by bm25, with paper_id as a
 stable tie breaker. JSON results show paper_id, title, the first three authors,
 announced and abs. The default limit is 20; override it with `--limit`. Without
 `--data-dir`, search uses `data-checkout`; without `--index`, it uses
-`<data-dir>/index.sqlite3`. Rebuild explicitly after paper data changes.
+`<data-dir>/index.sqlite3`. Each search compares a stored source fingerprint
+(relative JSONL paths and content SHA-256) with the current paper shards.
+Added, modified or deleted shards trigger a rebuild; identical contents reuse
+the existing index even if checkout timestamps changed. Older index formats
+without current metadata are rebuilt automatically.
 
 Queries are literal text by default: tokenize into words and quote each word
 before using FTS5, so hyphens, plus signs, quotes and parentheses cannot become
 query syntax. `--raw` explicitly enables advanced FTS5 syntax. The tokenizer is
-`unicode61 remove_diacritics 2`. SQLite does not decompose ø, so both indexed
+`porter unicode61 remove_diacritics 2`, so English singular/plural forms match
+through stemming. SQLite does not decompose ø, so both indexed
 search text and queries additionally fold ø/Ø to o/O; displayed metadata keeps
 the original spelling. This enables Moller to find Møller. Search is full-text
 only; vector retrieval belongs to Layer 2.
@@ -323,6 +328,6 @@ Matching builds indexes once and performs dictionary lookups per input instead
 of scanning and re-normalizing every stored title. Tests bound normalization
 calls by the input/store size, without machine-dependent timing assertions.
 
-The store performs no fuzzy deduplication or metadata resolution. Embeddings,
-indexing and email access belong to subsequent PRs. Backfill never changes the
-legacy tracker.
+The store performs no fuzzy deduplication or metadata resolution. Embeddings
+and indexing use the separate commands above; email access belongs to PR 6.
+Backfill never changes the legacy tracker.
