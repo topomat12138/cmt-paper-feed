@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "items": [
+    {"title": "Synthetic arXiv document", "url": "https://arxiv.org/abs/2610.99901v2?tracking=synthetic-query"},
+    {"title": "SYNTHETIC ARXIV DOCUMENT", "url": null},
+    {"title": "Synthetic journal document", "url": "https://link.aps.org/pdf/10.1103/abcd-1234"},
+    {"title": "Synthetic Scholar-only document", "url": "https://scholar.google.com/scholar?cluster=synthetic-query"},
+    {"title": "", "url": "https://example.org/not-a-paper"}
+  ]
+}

@@ -20,6 +20,7 @@ permissions:
 concurrency:
   group: cmt-paper-feed-data
   cancel-in-progress: false
+  queue: max
 
 jobs:
   backfill:

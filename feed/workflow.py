@@ -125,10 +125,12 @@ def checkout_legacy(directory: str | Path) -> None:
 
 def commit_message(report_path: str | Path, kind: str) -> str:
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    if kind == "embed":
+    if kind in {"embed", "scholar"}:
         counts = [report.get(key) for key in ("new", "updated")]
         if any(type(count) is not int or count < 0 for count in counts):
-            raise WorkflowError("embedding report requires nonnegative new and updated counts")
+            raise WorkflowError(f"{kind} report requires nonnegative new and updated counts")
+        if kind == "scholar":
+            return f"data: scholar {counts[0]}/{counts[1]}"
         return f"data: embeddings {sum(counts)}"
     if kind == "backfill":
         first = date.fromisoformat(report["first_file_date"])
@@ -144,7 +146,7 @@ def commit_message(report_path: str | Path, kind: str) -> str:
 def publish_data(directory: str | Path, *, report_path: str | Path, kind: str,
                  token: str | None = None) -> bool:
     allowed = {"ingest": {"papers", "daily"}, "backfill": {"papers", "daily"},
-               "embed": {"embeddings"}}
+               "embed": {"embeddings"}, "scholar": {"papers", "daily"}}
     if kind not in allowed:
         raise WorkflowError("unknown data publication kind")
     areas = allowed[kind]
@@ -194,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     publish = sub.add_parser("publish")
     publish.add_argument("--directory", type=Path, required=True)
     publish.add_argument("--report", type=Path, required=True)
-    publish.add_argument("--kind", choices=["ingest", "backfill", "embed"], required=True)
+    publish.add_argument("--kind", choices=["ingest", "backfill", "embed", "scholar"], required=True)
     args = parser.parse_args(argv)
     token = os.environ.get("FEED_GITHUB_TOKEN")
     try:

@@ -34,7 +34,8 @@ def ingest_sources(sources: dict[str, Source], *, data_dir: str | Path,
     for announced in sorted(dates):
         batch = [paper for paper in papers if (paper.announced or fallback) == announced]
         failures = [error for error in errors if error.announced in (None, announced)]
-        merged = store.upsert(batch, day=announced, source_errors=failures)
+        active = set(sources) | {error.source for error in errors}
+        merged = store.upsert(batch, day=announced, source_errors=failures, error_sources=active)
         reports.append({"date": announced.isoformat(), "fetched": len(batch), "new": len(merged.new),
                         "updated": len(merged.updated),
                         "errors": [error.model_dump(mode="json") for error in merged.errors]})

@@ -4,6 +4,8 @@ Oct 28, 2026 · @Zhuo
 
 > 导出自 Claude Docs 原文档：https://claude.ai/artifact/7L9xkC1FZ8NNBfZVzq3xsn（2026-10-28，rev 7）。以原文档为准，这里是给 Codex 读的副本。
 
+> 2026-10-29 更新：PR 6 的邮箱接入方案已由仓库所有者改为外部 Apps Script → repository_dispatch；以下 PR 6、对应决策表和 daily 接口补充以此更新为准。
+
 ## 目标与硬性边界
 
 第 1 层是一个公开仓库，每天自动把多个来源的新论文收进来，去重、算向量、建全文索引，存成结构化数据供第 2 层读取。它不打分、不筛选、不写摘要。本规格是写给 Codex 执行的，每一步是一个独立的 PR。
@@ -32,13 +34,13 @@ cmt-paper-feed/
     sources/
       base.py            # Source 接口 + 注册装饰器
       arxiv_listing.py   # arxiv.org/list/<cat>/new
-      scholar_alert.py   # Google Scholar 提醒邮件
+      scholar_alert.py   # Scholar 公开标题/链接 dispatch，不读取邮件
     resolve.py           # 把不完整的记录补全为 arXiv / DOI 元数据
     dedup.py
     store.py             # 读写 data 分支的 jsonl
     embed.py
     build_index.py       # 从 jsonl 生成 SQLite FTS5 索引
-    cli.py               # feed ingest / embed / index / backfill
+    cli.py               # feed ingest / scholar / embed / index / search / backfill
   config/sources.yml
   tests/
   .github/workflows/ingest.yml
@@ -77,11 +79,11 @@ SQLite 索引不提交到 git（二进制文件会让仓库历史膨胀），由
 - `paper_id` 有 arXiv 号时用 `arxiv:<不带版本号>`，否则用 `doi:<小写 DOI>`；两者都没有时用 `title:<归一化标题的 sha1 前 12 位>`，并在之后能解析出 arXiv/DOI 时合并。
 - `listing_type` 取 `new` / `cross` / `replacement`；`sources` 是集合，同一篇从两个来源进来时合并。
 - 合并规则：非空字段不被空值覆盖；`arxiv_version` 取最大；`first_seen` 不变。
-- `daily/<date>.json` 格式：`{"date": "2026-10-28", "new": [paper_id...], "updated": [paper_id...]}`，第 2 层每天只读这个文件就知道要处理哪些论文。
+- `daily/<date>.json` 格式：`{"date": "2026-10-28", "new": [paper_id...], "updated": [paper_id...]}`，第 2 层据此处理新增及更新论文。第 2 层应处理自上次运行以来新增或变化的所有 daily 文件，而不是只读一个日期。
 
 ## 分步实现
 
-一共 6 个 PR，按顺序做。PR 1–5 可以马上开始；PR 6 要等下一节的邮箱方案定下来。每个 PR 都要带测试，测试不联网，网络请求用保存的样例文件代替。
+一共 6 个 PR，按顺序做。PR 6 的外部 dispatch 方案现已确定。每个 PR 都要带测试，测试不联网，网络请求用保存或人工构造的样例响应代替。
 
 ### PR 1：骨架、数据模型与存储
 
@@ -120,21 +122,53 @@ SQLite 索引不提交到 git（二进制文件会让仓库历史膨胀），由
 - 把历史数据的向量一次性补算。
 - **验收**：每日增量的向量计算在 Actions 上不超过 10 分钟；重跑不重算；索引能从零生成。
 
-### PR 6：Google Scholar 提醒来源（等邮箱方案）
+### PR 6：Google Scholar 提醒来源（外部 dispatch）
 
-- 从邮箱读取发件人为 `scholaralerts-noreply@google.com` 的未处理邮件，解析每条的标题、作者行和链接（链接通常是 scholar.google.com 的跳转，取出其中的真实 URL）。
-- `resolve.py`：真实 URL 是 arXiv 就取 arXiv 号；否则按标题查 arXiv API，再查 Crossref 或 OpenAlex 拿 DOI；都查不到就存为 `title:` 记录。
-- 处理完的邮件打标签或标已读，保证不重复处理。遵守硬性边界第 2 条。
-- **验收**：用人工构造的样例邮件测试（不提交真实邮件）；端到端跑一次后，绝大多数条目解析出 arXiv 号或 DOI。
+- 读邮件在仓库外完成：外部 Gmail 的 Google Apps Script 已另行实现，每天只提取论文标题和真实链接，调用 GitHub API 的 `repository_dispatch`。脚本、邮箱凭据、邮件原文、提醒名称和触发作者均不在本仓库中处理或保存。
+- 事件类型为 `scholar_alert`，`client_payload` 格式为 `{"version": 1, "items": [{"title": "...", "url": "https://..."}]}`，URL 可为 null。脚本每批最多 50 条，一天可以多批，也可能重试重复发送；存储必须幂等。
+- `scholar.yml` 名称为 `Scholar alert ingest`，支持 `repository_dispatch(types: [scholar_alert])` 和带 `items_json` 输入的 `workflow_dispatch`。只声明 `contents: write`，与其他数据工作流共用 `cmt-paper-feed-data` concurrency 组。该组的四个写入工作流统一使用 `queue: max`，避免多批 dispatch 在默认单个 pending 队列中互相替换。
+- 工作流 checkout main 和隔离的 data，运行 `feed scholar --data-dir DIR --payload "$GITHUB_EVENT_PATH"`。手动输入也从该事件文件读取，避免把原始 items 放进步骤环境变量、shell 表达式或日志；本地测试可用 `--items-json`。
+- JSON 报告只包含新增/更新、输入及去重数量、各解析路径数量和错误分类计数，写入 step summary；不打印整段 payload 或 URL 查询串。成功部分照常发布，再报告失败。`publish --kind scholar` 只提交 papers/、daily/，提交信息为 `data: scholar <新增>/<更新>`；无变化不提交。
+- 在 embed.yml 的 `workflow_run` 列表加入 `Scholar alert ingest`，发布后的新记录自动补向量。
+
+**输入校验（sources/scholar_alert.py）**
+
+- version 严格为整数 1；items 必须是列表且至多 200 条。标题必须为 1–1000 字符的非空字符串；URL 仅允许 null 或至多 2000 字符、以 http/https 开头的字符串。非法条目跳过并记录 `invalid_item`，不能拖垮整批。
+- scholar.google.* / google.* 主机的 URL 视为 null。同批归一化标题相同的条目合并；论文标题中的 Unicode 下标和 LaTeX 数学定界符应归一化为相同文本，如 MnBi₂Te₄ 与 MnBi$_2$Te$_4$。
+- 标题匹配另用 `normalize_title` 结果去掉所有空白的比较键，使 Scholar 插入空格的化学式能匹配 arXiv 的紧凑写法。arXiv/OpenAlex 的精确/前缀比较、Scholar 批内去重和 DOI 关联、store 标题索引统一使用此键，仍执行原有唯一性/歧义检查。`normalize_title` 和 `paper_id` 的生成规则不变，不迁移已有 ID。
+
+**解析顺序（resolve.py，每步命中就停）**
+
+1. 从 arxiv.org 的 /abs/ 或 /pdf/ URL 提取 arXiv 号，支持版本、.pdf 后缀和旧式 cond-mat/0601001。
+2. 提取 doi.org 或出版商 URL 路径中的 `10.\d{4,9}/...`，去掉末尾 /abstract、/full、/pdf、.pdf 等；Nature /articles/<slug> 映射为 10.1038/<slug>。APS 新式短 DOI、Wiley /doi/abs|full|pdf/ 和 IOP 都要支持；ScienceDirect 的 pii 不当作 DOI。
+3. 用 arXiv API 的 ti 短语查询回查标题，沿用 PR 2 的限速/重试，仅接受归一化标题完全相等的唯一候选。
+4. 用 OpenAlex `/works?filter=title.search:<归一化标题>&per_page=50` 回查标题，User-Agent 只写仓库 URL、不带邮箱。检查前 50 条中的归一化标题完全相等候选，不因 meta.count 大于已返回条数而放弃。同标题的预印本/正式版 work 合并标识：locations 中的 arXiv 号须唯一，期刊 DOI 须唯一（排除 `10.48550/arXiv.*`）；仅保留唯一的标识，两者都不唯一时放弃。
+5. 均未命中时保留 title: 记录，仅有公开标题和 sources=["scholar_alert"]。
+
+标题以 … 或 ... 结尾时，第 3、4 步改为归一化前缀匹配，但截断前内容至少 60 字符，且须对应唯一完整归一化标题。arXiv 未完整返回的搜索结果不能用来猜测唯一候选；OpenAlex 按上述前 50 条规则处理。
+
+拿到 arXiv 号后复用现有批量元数据接口（每批至多 100、请求至少间隔 3 秒、最多 3 次尝试），生成完整 Paper，listing_type 和 announced 留 null。只有 DOI 时用 OpenAlex 元数据的标题、作者、abstract_inverted_index 还原摘要和期刊名组装 Paper，links 只放 canonical DOI。已知 DOI 的元数据请求失败或返回 404 时保留 DOI、输入标题和 canonical DOI 链接，记录 resolution_failure，不退化为 title:。Crossref 后备可选，本 PR 不要求。
+
+Scholar 的 DOI-only 记录写入前，若已有记录中恰好有一条 arXiv 记录同时满足归一化标题完全相等、至少一位作者姓氏相同、自身没有 DOI，则关联到该 arXiv 记录，计数为 doi_title_link；其他情况维持原合并规则。已有 DOI 强匹配优先，多个不同 DOI 不能同时认领同一条无 DOI 的 arXiv 记录。通用存储不对已识别记录仅按标题合并。
+
+所有输入记录的 sources 仅为 ["scholar_alert"]，再复用既有合并逻辑；已有 arxiv_listing 记录增加来源，计作本次 updated。外部失败按条目隔离，退回 title: 或记录安全错误，不影响其他成功论文；不请求 payload 中任意 URL，不保留其查询串。
+
+所有诊断仍写入 daily 和计数报告。后续步骤成功解析或保住 DOI 时不因 resolution_failure 单独标红；输入不合法、因失败退化为 title-only、存储失败或标识冲突仍返回非零。以上解析细化按 PR 6 的 Claude 审查意见更新。
+
+**daily 与验收**
+
+- daily 使用运行时 UTC 日期，与 arXiv 同日的 new/updated 清单累加，不覆盖既有记录；周末只含 Scholar 条目的 daily 文件也是正常结果。
+- 离线测试用人工 payload 和 httpx.MockTransport，不使用真实邮件/提醒内容。覆盖 URL 变体、唯一/歧义/截断标题、非法项、Google 链接、Unicode/LaTeX、重复发送字节不变、来源并集、周末 daily、发布目录隔离和 actionlint。
+- scholar.yml 不使用 secrets，仅 checkout/publish 使用 github.token；不打印 github.event 内容。PR 描述列出验收证据、偏离清单及合并后在 Actions 粘贴两条公开样例（arXiv + 期刊 DOI）进行手动验证的方法。
 
 ## 开工前要定的事
 
-只有第 1 条会挡住 PR 1，第 2 条挡住 PR 6，其余都有默认值，你不改就按默认做。
+仓库创建已完成，Scholar 接入方案已确定；其余事项继续使用已确认的范围或默认值。
 
 | 事项 | 默认 | 说明 |
 | --- | --- | --- |
 | 创建公开仓库 | 你在 GitHub 上建 `topomat12138/cmt-paper-feed`，空仓库 | 名字可以改；我这边不能建仓库 |
-| Scholar 提醒怎么读 | 新建一个专用 Gmail，在主邮箱设过滤器把 Scholar 提醒自动转发过去，工作流用 IMAP + 应用专用密码读取 | 好处是工作流碰不到主邮箱。另一种是 Gmail API 授权主邮箱，配置更复杂、权限更大 |
+| Scholar 提醒怎么读 | 已定：仓库外的 Gmail Google Apps Script 只发送公开标题/真实链接，以 scholar_alert repository_dispatch 传入 version 1 的 items | 脚本每批最多 50 条，可重复发送；仓库校验至多 200 条并幂等合并。不读取邮箱，不接触邮箱凭据、邮件原文、提醒名称或触发作者；脚本不在本 PR 范围 |
 | arXiv 分类 | supr-con、mes-hall、str-el、mtrl-sci | 候选变多只增加第 2 层的计算量，不增加你的阅读量 |
 | 旧 tracker | 第 2 层上线前继续运行 | 新旧可以对照几天 |
 | 旧仓库里公开的画像与反馈 | 从当前版本删掉 `config/profile.yml`、`keywords.manual.yml`、`topic_tags.yml`、`ranking.yml` 和 data 分支的 `feedback/`，历史记录保留 | 内容不算敏感；若要彻底清除，只能重写历史或把仓库设为私有 |

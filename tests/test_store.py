@@ -388,14 +388,14 @@ def test_title_normalization_work_is_linear(tmp_path, paper, monkeypatch):
     unresolved = [paper(arxiv_id=None, arxiv_version=None, title=f"Pending {i}") for i in range(20)]
     store.upsert([*known, *unresolved], day=DAY)
     calls = 0
-    normalize = store_module.normalize_title
+    match_key = store_module.title_match_key
 
     def counted(title):
         nonlocal calls
         calls += 1
-        return normalize(title)
+        return match_key(title)
 
-    monkeypatch.setattr(store_module, "normalize_title", counted)
+    monkeypatch.setattr(store_module, "title_match_key", counted)
     new = [paper(arxiv_id=f"2610.{600 + i:05d}", title=f"New {i}") for i in range(100)]
     resolved = [paper(arxiv_id=f"2610.{1000 + i:05d}", title=f"Pending {i}") for i in range(20)]
     result = store.upsert([*new, *resolved], day=NEXT)
@@ -404,7 +404,57 @@ def test_title_normalization_work_is_linear(tmp_path, paper, monkeypatch):
     assert result.updated == sorted(p.paper_id for p in resolved)
     assert len(store.load()) == 320
     # Count operations rather than impose a machine-dependent time limit.
-    assert calls <= len(known) + len(unresolved) + 2 * (len(new) + len(resolved))
+    assert len(known) + len(unresolved) <= calls <= len(known) + len(unresolved) + 2 * (len(new) + len(resolved))
+
+
+@pytest.mark.parametrize("order", ["weak_first", "identified_first", "same_batch"])
+def test_whitespace_title_index_promotes_or_merges_one_record_and_replays(tmp_path, paper, order):
+    store = PaperStore(tmp_path)
+    identified = paper(title="Synthetic magnetism in Ag$3$LiRh$2$O$6$", first_seen=LATER, last_updated=LATER)
+    weak = paper(arxiv_id=None, arxiv_version=None,
+                 title="Synthetic magnetism in Ag $ *3 $ LiRh $ 2 $ O $ 6$", sources=["scholar_alert"])
+    if order == "same_batch":
+        result = store.upsert([weak, identified], day=NEXT)
+    else:
+        first, second = (weak, identified) if order == "weak_first" else (identified, weak)
+        store.upsert([first], day=DAY)
+        result = store.upsert([second], day=NEXT)
+        assert result.new == [] and result.updated == [identified.paper_id]
+    assert result.errors == []
+    merged = store.load()
+    assert set(merged) == {identified.paper_id}
+    assert merged[identified.paper_id].sources == ["arxiv_listing", "scholar_alert"]
+    assert merged[identified.paper_id].first_seen == weak.first_seen
+    before = snapshot(tmp_path)
+    # Reload the compact title index from disk before replaying the variants.
+    PaperStore(tmp_path).upsert([identified, weak], day=NEXT)
+    assert snapshot(tmp_path) == before
+
+
+def test_whitespace_title_collisions_keep_identified_records_separate_and_reject_weak_input(tmp_path, paper):
+    store = PaperStore(tmp_path)
+    first = paper(title="Synthetic Ag$3$LiRh$2$O$6$ paper")
+    second = paper(arxiv_id="2610.99999", title="Synthetic Ag $ 3 $ LiRh $ 2 $ O $ 6$ paper")
+    store.upsert([first, second], day=DAY)
+    assert store.load() == {first.paper_id: first, second.paper_id: second}
+    weak = paper(arxiv_id=None, arxiv_version=None, title=first.title, sources=["scholar_alert"])
+    result = store.upsert([weak], day=NEXT)
+    assert result.new == result.updated == []
+    assert result.errors[0].code == "ambiguous_title"
+    assert result.errors[0].matched_ids == sorted([first.paper_id, second.paper_id])
+    assert store.load() == {first.paper_id: first, second.paper_id: second}
+
+
+def test_whitespace_only_weak_title_variants_merge_and_replay_without_alias_cycles(tmp_path, paper):
+    store = PaperStore(tmp_path)
+    first = paper(arxiv_id=None, arxiv_version=None, title="Synthetic Ag$3$LiRh$2$O$6$ paper")
+    second = paper(arxiv_id=None, arxiv_version=None, title="Synthetic Ag $ 3 $ LiRh $ 2 $ O $ 6$ paper")
+    assert first.paper_id != second.paper_id  # Identity generation is unchanged.
+    result = store.upsert([first, second], day=DAY)
+    assert len(result.new) == len(store.load()) == 1 and result.errors == []
+    before = snapshot(tmp_path)
+    assert store.upsert([second, first], day=DAY) == result
+    assert snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize("corruption", ["invalid json", "wrong shard", "duplicate"])
