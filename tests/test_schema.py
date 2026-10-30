@@ -48,6 +48,9 @@ def test_doi_identity_lowercase(paper, doi):
     (r"The $\mathrm{BCS}$ \textbf{State}: A-Test", "the bcs state a test"),
     ("A\tB\nC", "a b c"),
     ("Pairing, “Theory” + Transport", "pairing theory transport"),
+    ("MnBi₂Te₄", "mnbi2te4"),
+    (r"MnBi$_2$Te$_4$", "mnbi2te4"),
+    (r"MnBi$_{2}$Te$_{4}$", "mnbi2te4"),
 ])
 def test_title_normalization(title, expected):
     assert normalize_title(title) == expected

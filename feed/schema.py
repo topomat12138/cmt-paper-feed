@@ -21,6 +21,9 @@ def normalize_title(title: str) -> str:
     """
     text = unicodedata.normalize("NFKC", title)
     text = re.sub(r"\\[a-zA-Z]+\*?", "", text)
+    # TeX math delimiters bind chemical subscripts to their element symbols:
+    # MnBi$_2$Te$_4$ and NFKC-normalized MnBi₂Te₄ must share one identity.
+    text = text.translate(str.maketrans("", "", "$_{}"))
     text = text.replace("\\", "")
     text = "".join(" " if unicodedata.category(c)[0] in "PS" else c for c in text)
     return " ".join(text.lower().split())

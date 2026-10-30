@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import shutil
 import subprocess
 from datetime import date, datetime, timezone
@@ -18,6 +19,17 @@ from feed.store import DailyManifest, PaperStore
 DAY = date(2026, 10, 28)
 SEEN = datetime(2026, 10, 28, 1, 30, tzinfo=timezone.utc)
 ROOT = Path(__file__).parents[1]
+
+
+def test_actionlint_queue_compatibility_does_not_hide_other_diagnostics():
+    config = yaml.safe_load((ROOT / ".github/actionlint.yaml").read_text())
+    assert set(config["paths"]) == {".github/workflows/{backfill,embed,ingest,scholar}.yml"}
+    patterns = next(iter(config["paths"].values()))["ignore"]
+    assert len(patterns) == 1
+    known = 'unexpected key "queue" for "concurrency" section. expected one of "cancel-in-progress", "group"'
+    assert re.fullmatch(patterns[0], known)
+    assert not re.search(patterns[0], known.replace('"queue"', '"queues"'))
+    assert not re.search(patterns[0], 'unknown permission scope "contents"')
 
 
 def git(root, *args):
@@ -258,6 +270,52 @@ def test_embed_commit_message_rejects_invalid_counts(tmp_path, count):
         workflow.commit_message(report(tmp_path, {"new": count, "updated": 0}), "embed")
 
 
+def test_scholar_publication_only_commits_papers_and_daily_with_noop_replay(remote, tmp_path, paper):
+    root = seeded_checkout(remote, tmp_path, paper)
+    main_before = git(remote, "rev-parse", "main")
+    scholar = paper(arxiv_id="2610.90000", announced=None, listing_type=None, sources=["scholar_alert"])
+    PaperStore(root).upsert([scholar], day=DAY)
+    for area in ("embeddings/2026/2026-10.parquet", "unrelated.txt"):
+        path = root / area
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("must not publish")
+    path = report(tmp_path, {"date": DAY.isoformat(), "new": 1, "updated": 0,
+                            "resolution_counts": {"arxiv_url": 1}, "error_counts": {}})
+    assert workflow.main(["publish", "--directory", str(root), "--report", str(path), "--kind", "scholar"]) == 0
+    assert git(remote, "log", "-1", "--format=%s", "data") == "data: scholar 1/0"
+    assert git(remote, "diff", "--name-only", "data~1", "data").splitlines() == [
+        "daily/2026-10-28.json", "papers/2026/2026-10.jsonl",
+    ]
+    assert set(git(remote, "ls-tree", "--name-only", "data").splitlines()) == {"daily", "papers"}
+    first = git(remote, "rev-parse", "data")
+    again = tmp_path / "scholar-again"
+    workflow.checkout_data(str(remote), again)
+    PaperStore(again).upsert([scholar], day=DAY)
+    assert not workflow.publish_data(again, report_path=path, kind="scholar")
+    assert git(remote, "rev-parse", "data") == first
+    assert git(remote, "rev-list", "--count", "data") == "2"
+    assert git(remote, "rev-parse", "main") == main_before
+
+
+@pytest.mark.parametrize("area", ["embeddings/2026/2026-10.parquet", "unrelated.txt"])
+def test_scholar_publication_rejects_pre_staged_non_paper_data(remote, tmp_path, paper, area):
+    root = seeded_checkout(remote, tmp_path, paper)
+    previous = git(remote, "rev-parse", "data")
+    path = root / area
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("must not publish")
+    git(root, "add", "--", area)
+    with pytest.raises(workflow.WorkflowError, match="non-data"):
+        workflow.publish_data(root, report_path=report(tmp_path, {"new": 1, "updated": 0}), kind="scholar")
+    assert git(remote, "rev-parse", "data") == previous
+
+
+@pytest.mark.parametrize("count", [-1, True, "1", None])
+def test_scholar_commit_message_rejects_invalid_counts(tmp_path, count):
+    with pytest.raises(workflow.WorkflowError, match="nonnegative"):
+        workflow.commit_message(report(tmp_path, {"new": 0, "updated": count}), "scholar")
+
+
 def test_checkout_rejects_paths_inside_code_workspace(remote, tmp_path, monkeypatch):
     workspace = tmp_path / "code"
     workspace.mkdir()
@@ -409,7 +467,7 @@ def test_workflows_share_lock_have_minimal_permissions_and_publish_before_failin
     assert workflows["ingest"]["on"]["schedule"] == [{"cron": "30 1 * * *"}]
     assert "workflow_dispatch" in workflows["ingest"]["on"]
     assert workflows["ingest"]["concurrency"] == workflows["backfill"]["concurrency"] == {
-        "group": "cmt-paper-feed-data", "cancel-in-progress": "false",
+        "group": "cmt-paper-feed-data", "cancel-in-progress": "false", "queue": "max",
     }
     for name, data in workflows.items():
         assert data["permissions"] == {"contents": "write"}
@@ -439,7 +497,7 @@ def test_embed_workflow_is_independent_uses_shared_lock_cpu_runtime_and_pinned_m
     ingest = yaml.load((ROOT / ".github/workflows/ingest.yml").read_text(), Loader=yaml.BaseLoader)
     assert set(data["on"]) == {"workflow_run", "workflow_dispatch"}
     assert data["on"]["workflow_run"] == {
-        "workflows": ["Daily arXiv ingest", "Historical arXiv backfill"],
+        "workflows": ["Daily arXiv ingest", "Historical arXiv backfill", "Scholar alert ingest"],
         "types": ["completed"], "branches": ["main"],
     }
     assert data["permissions"] == {"contents": "write"}
@@ -473,7 +531,45 @@ def test_embed_workflow_is_independent_uses_shared_lock_cpu_runtime_and_pinned_m
     assert steps[-1]["run"] == "exit 1"
 
 
-@pytest.mark.parametrize("name", ["ingest", "backfill", "embed"])
+def test_scholar_workflow_uses_event_file_without_exposing_payload_or_secrets():
+    path = ROOT / ".github/workflows/scholar.yml"
+    raw = path.read_text()
+    data = yaml.load(raw, Loader=yaml.BaseLoader)
+    ingest = yaml.load((ROOT / ".github/workflows/ingest.yml").read_text(), Loader=yaml.BaseLoader)
+    assert data["name"] == "Scholar alert ingest"
+    assert set(data["on"]) == {"repository_dispatch", "workflow_dispatch"}
+    assert data["on"]["repository_dispatch"] == {"types": ["scholar_alert"]}
+    assert data["on"]["workflow_dispatch"]["inputs"]["items_json"]["type"] == "string"
+    assert data["permissions"] == {"contents": "write"}
+    assert data["concurrency"] == ingest["concurrency"]
+    assert "secrets." not in raw and "github.event" not in raw
+    assert "inputs.items_json" not in raw and "client_payload" not in raw
+    steps = data["jobs"]["scholar"]["steps"]
+    assert steps[0]["with"] == {"ref": "main", "persist-credentials": "false"}
+    operation = next(step for step in steps if step.get("id") == "scholar")
+    assert operation["continue-on-error"] == "true"
+    assert '--payload "$GITHUB_EVENT_PATH"' in operation["run"]
+    assert "--items-json" not in operation["run"]
+    assert operation.get("env", {}) == {}
+    assert '--data-dir "$RUNNER_TEMP/feed-data"' in operation["run"]
+    assert "cat" not in operation["run"] and "echo" not in operation["run"]
+    install = next(step["run"] for step in steps if "uv sync" in step.get("run", ""))
+    assert "--locked --no-dev" in install and "--extra" not in install
+    tokens = [step for step in steps if "FEED_GITHUB_TOKEN" in step.get("env", {})]
+    assert len(tokens) == 2
+    assert all(step["env"]["FEED_GITHUB_TOKEN"] == "${{ github.token }}" for step in tokens)
+    assert all("feed.workflow checkout" in step["run"] or "feed.workflow publish" in step["run"] for step in tokens)
+    summary = next(step for step in steps if "$GITHUB_STEP_SUMMARY" in step.get("run", ""))
+    assert "steps.scholar.outcome == 'failure'" in summary["if"]
+    assert "$GITHUB_EVENT_PATH" not in summary["run"]
+    publish = next(step for step in steps if "feed.workflow publish" in step.get("run", ""))
+    assert "--kind scholar" in publish["run"] and "steps.scholar.outcome == 'failure'" in publish["if"]
+    assert steps.index(operation) < steps.index(summary) < steps.index(publish)
+    assert "steps.scholar.outcome == 'failure'" in steps[-1]["if"]
+    assert steps[-1]["run"] == "exit 1"
+
+
+@pytest.mark.parametrize("name", ["ingest", "backfill", "embed", "scholar"])
 @pytest.mark.parametrize("has_report", [True, False])
 def test_workflow_summary_shows_report_or_missing_report_diagnostic(tmp_path, name, has_report):
     workflow_yaml = yaml.load((ROOT / f".github/workflows/{name}.yml").read_text(), Loader=yaml.BaseLoader)

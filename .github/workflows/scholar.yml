@@ -1,0 +1,66 @@
+name: Scholar alert ingest
+
+on:
+  repository_dispatch:
+    types: [scholar_alert]
+  workflow_dispatch:
+    inputs:
+      items_json:
+        description: JSON array of public paper titles and URLs
+        type: string
+        required: true
+        default: '[]'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cmt-paper-feed-data
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  scholar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          version: '0.13.6'
+          python-version: '3.12'
+          enable-cache: true
+      - name: Install locked runtime
+        run: uv sync --locked --no-dev
+      - name: Prepare isolated data checkout
+        env:
+          FEED_GITHUB_TOKEN: ${{ github.token }}
+        run: uv run --no-sync python -m feed.workflow checkout --directory "$RUNNER_TEMP/feed-data"
+      - name: Ingest public Scholar items from event file
+        id: scholar
+        continue-on-error: true
+        run: uv run --no-sync feed scholar --data-dir "$RUNNER_TEMP/feed-data" --payload "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/feed-scholar.json"
+      - name: Summarize Scholar item counts
+        if: ${{ !cancelled() && (steps.scholar.outcome == 'success' || steps.scholar.outcome == 'failure') }}
+        run: |
+          {
+            printf '### Scholar ingest report\n\n'
+            if [[ -s "$RUNNER_TEMP/feed-scholar.json" ]]; then
+              printf '```json\n'
+              cat "$RUNNER_TEMP/feed-scholar.json"
+              printf '\n```\n'
+            else
+              printf 'No JSON report was produced. See step errors above.\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish successful records and diagnostics
+        if: ${{ !cancelled() && (steps.scholar.outcome == 'success' || steps.scholar.outcome == 'failure') }}
+        env:
+          FEED_GITHUB_TOKEN: ${{ github.token }}
+        run: uv run --no-sync python -m feed.workflow publish --directory "$RUNNER_TEMP/feed-data" --report "$RUNNER_TEMP/feed-scholar.json" --kind scholar
+      - name: Mark incomplete Scholar ingestion as failed
+        if: ${{ !cancelled() && steps.scholar.outcome == 'failure' }}
+        run: exit 1

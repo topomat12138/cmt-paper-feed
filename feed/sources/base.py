@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from feed.schema import Paper
-from feed.errors import SourceFailure
+from feed.errors import ScholarIssue, SourceFailure
 
 
 class SourceError(RuntimeError):
@@ -16,7 +16,7 @@ class SourceError(RuntimeError):
 class SourceResult:
     announcement_dates: tuple[date, ...]
     papers: list[Paper]
-    errors: list[SourceFailure] = field(default_factory=list)
+    errors: list[SourceFailure | ScholarIssue] = field(default_factory=list)
 
 
 class Source(ABC):

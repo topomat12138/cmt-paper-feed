@@ -2,7 +2,7 @@ name: Paper embeddings
 
 on:
   workflow_run:
-    workflows: [Daily arXiv ingest, Historical arXiv backfill]
+    workflows: [Daily arXiv ingest, Historical arXiv backfill, Scholar alert ingest]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -13,6 +13,7 @@ permissions:
 concurrency:
   group: cmt-paper-feed-data
   cancel-in-progress: false
+  queue: max
 
 jobs:
   embed:

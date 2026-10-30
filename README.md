@@ -1,10 +1,11 @@
 # cmt-paper-feed
 
 Public paper metadata for downstream tools. The implementation follows
-[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 5**:
+[`docs/spec-layer1.md`](docs/spec-layer1.md). Implemented through **PR 6**:
 the uv project, Pydantic v2 data contract, monthly JSONL storage, and the arXiv
 listing/API source, historical backfill, isolated data-branch workflows,
-incremental CPU document vectors and rebuildable local full-text search.
+incremental CPU document vectors, rebuildable local full-text search and public
+Scholar title/link dispatch ingestion.
 
 ## Development
 
@@ -18,7 +19,9 @@ uv run --no-sync pytest
 `test.yml` runs these checks on pull requests and pushes to `main`, on Python
 3.11, 3.12, and 3.13. Tests use synthetic records and temporary directories and
 make no network requests. Installing dependencies requires network access.
-CI also runs SHA-256-pinned actionlint 1.7.12 against all workflow files.
+CI also runs SHA-256-pinned actionlint 1.7.12 against all workflow files. Its
+configuration has one precise compatibility exception for GitHub's new queue
+field; tests independently check the exact queue setting on all data writers.
 The development group includes NumPy/PyArrow for fake-vector tests; it does not
 install torch or download a model. Production ingest uses `--no-dev` and installs
 none of the vector dependencies. Real-model smoke tests are skipped by default.
@@ -118,6 +121,71 @@ The [real import report](docs/pr3-validation.md) records 193 source files,
 comparison across two imports. The specification's approximately 4200 estimate
 matches the raw row count, not the unique-paper count in this source snapshot.
 
+## Scholar dispatch ingestion
+
+Email reading belongs to an external Google Apps Script. This repository does
+not contain that script, mailbox credentials, original emails, alert names or
+triggering-author information. The external sender submits repository_dispatch
+type `scholar_alert` with `client_payload`:
+
+```json
+{"version":1,"items":[{"title":"A public paper title","url":"https://arxiv.org/abs/2610.12345"}]}
+```
+
+The sender normally sends at most 50 items per request. The receiver validates
+up to 200, skips invalid entries with `invalid_item`, and combines equal
+normalized titles deterministically. Titles must be nonblank strings of at
+most 1000 characters; URLs must be null or HTTP(S) strings of at most 2000.
+Google/Scholar links become null. URL query strings/fragments and payload extras
+are discarded. Credential-bearing/malformed URLs and invalid Unicode are rejected.
+
+```sh
+uv run --no-sync feed scholar --data-dir /path/to/data-checkout --payload /tmp/event.json
+uv run --no-sync feed scholar --data-dir /path/to/data-checkout --items-json '[{"title":"Synthetic local test","url":null}]'
+```
+
+`--payload` accepts a GitHub event, a versioned payload or an items array. The
+manual Actions input `items_json` is decoded inside the process from the event
+file; it is never copied into a workflow shell expression or environment value.
+The report contains only integer counts: received, valid, deduplicated, new,
+updated, resolution_counts and error_counts. It has no item titles, URLs or IDs.
+
+Resolution prefers URL arXiv IDs, then URL DOIs, exact normalized arXiv title
+matches, exact normalized OpenAlex title matches, then title-only records.
+arXiv abs/pdf/versioned/legacy IDs, APS short DOIs, Wiley and IOP DOI paths,
+and Nature article slugs are supported. ScienceDirect PII paths require title
+lookup. Long titles ending in … or ... use a unique prefix match only when the
+visible part is at least 60 characters; short truncated titles stay unresolved.
+Incomplete search pages cannot establish uniqueness. Chemical TeX delimiters
+are removed so MnBi₂Te₄ and MnBi$_2$Te$_4$ normalize identically.
+
+Only fixed arXiv/OpenAlex API endpoints are requested, with the repository URL
+as User-Agent and no email or API token. arXiv lookups and metadata share PR 2's
+three-second spacing, three-attempt retry budget and batches of at most 100 IDs.
+After a partial metadata batch exhausts retries, valid independent entries are
+kept; ambiguous duplicate entries are not guessed. OpenAlex metadata supplies
+DOI records, authors, reconstructed abstracts and journal names. Sources are
+`["scholar_alert"]`; announced and listing_type are null in incoming records.
+Existing data uses the normal merge rules and accumulates both source names.
+
+Remote failures retain title-only records and safe diagnostics while preserving
+successful items. The command writes the run's UTC daily file, including on
+weekends, and accumulates existing new/updated IDs. Diagnostics are replaced per
+source so Scholar and arXiv cannot erase one another's errors. Command counts
+describe this invocation; replaying the same payload changes no bytes, including
+on a later UTC day when there are no new records/errors to put in a new daily.
+Layer 2 must process every daily file added or changed since its previous run.
+
+The **Scholar alert ingest** workflow accepts repository_dispatch or manual
+`items_json`, runs on trusted main with the shared data lock and contents-only
+write permission, and publishes only papers/daily as `data: scholar <new>/<updated>`.
+Only checkout/publish get github.token. Counts appear in the step summary;
+successful data is published before a failing run is marked red. Its completion
+also triggers the separate embeddings workflow. See
+[PR 6 validation and manual test](docs/pr6-validation.md).
+All four writers use `queue: max` with the shared lock, retaining up to 100
+pending runs rather than replacing a pending dispatch with a later batch.
+
 ## Document embeddings
 
 ```sh
@@ -204,7 +272,8 @@ Its optional date input only validates the current announcement. Both workflows
 always check out code from main; data and legacy checkouts and reports live
 under `RUNNER_TEMP`, outside the code workspace. Both share concurrency group
 `cmt-paper-feed-data`, with running jobs never cancelled by another writer.
-Their only declared token permission is `contents: write`.
+Their only declared token permission is `contents: write`. Scholar uses this
+same lock and permission with its independent dispatch workflow.
 
 Paper publication allows only `papers/` and `daily/`; embedding publication
 allows only `embeddings/`. A clean Git index causes no
@@ -217,8 +286,9 @@ rebase and fails the job; no force push or automatic content overwrite occurs.
 The ingest step may fail while preserving valid papers and diagnostics. Its
 publish step still runs, and a final status step marks the job red afterward.
 Backfill likewise publishes valid changes before reporting any import conflict.
-Embedding runs in the independent **Paper embeddings** workflow after either
-paper workflow completes, including partial failures, or by workflow_dispatch.
+Embedding runs in the independent **Paper embeddings** workflow after arXiv
+ingest, historical backfill or Scholar ingest completes, including partial
+failures, or by workflow_dispatch.
 It executes trusted main code, uses the same concurrency group and only
 `contents: write` permission, and has a 60-minute limit for the initial historical
 calculation. A failed vector calculation cannot undo paper publication.
@@ -318,16 +388,20 @@ are historical and remain unchanged. Replaying a batch leaves both the monthly
 shards and current daily manifest byte-identical, including after reopening the
 store. An empty batch writes an empty manifest if none exists.
 
-Errors include the original `identifier_conflict` / `ambiguous_title` objects
-and `source_failure` diagnostics (source, stage, category, announcement date and
-affected paper IDs). They describe the latest attempt; recovery clears old
+Errors include the original `identifier_conflict` / `ambiguous_title` objects,
+`source_failure` diagnostics, and Scholar's `invalid_item` / `resolution_failure`.
+They describe the latest attempt per source; recovery clears only that source's
 errors, and unchanged failures do not append duplicate events. New/updated IDs
-still accumulate within the day. Backfill never reads or writes daily files.
+still accumulate within the day. The library's `error_sources` option scopes
+diagnostic replacement; `report_current=True` returns per-invocation changes
+without changing cumulative daily storage. Scholar also uses
+`write_empty_daily=False` to avoid creating new empty manifests on replays.
+Backfill never reads or writes daily files.
 
 Matching builds indexes once and performs dictionary lookups per input instead
 of scanning and re-normalizing every stored title. Tests bound normalization
 calls by the input/store size, without machine-dependent timing assertions.
 
-The store performs no fuzzy deduplication or metadata resolution. Embeddings
-and indexing use the separate commands above; email access belongs to PR 6.
-Backfill never changes the legacy tracker.
+The store performs no fuzzy deduplication or metadata resolution. Resolution,
+embeddings and indexing use the separate components above. Email access stays
+outside this repository. Backfill never changes the legacy tracker.

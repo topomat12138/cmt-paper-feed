@@ -1,0 +1,8 @@
+# GitHub supports queue: max; actionlint 1.7.12 (including current upstream
+# main) has not added this field yet. Keep every other diagnostic enabled.
+# https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
+# tests/test_workflow.py independently requires the exact shared queue setting.
+paths:
+  '.github/workflows/{backfill,embed,ingest,scholar}.yml':
+    ignore:
+      - '^unexpected key "queue" for "concurrency" section[.] expected one of "cancel-in-progress", "group"$'

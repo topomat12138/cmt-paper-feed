@@ -18,7 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from feed.schema import Paper, normalize_title
-from feed.errors import SourceFailure
+from feed.errors import ScholarIssue, SourceFailure
 
 
 class StoreConflict(BaseModel):
@@ -40,11 +40,11 @@ class DailyManifest(BaseModel):
     date: date
     new: list[str] = Field(default_factory=list)
     updated: list[str] = Field(default_factory=list)
-    errors: list[StoreConflict | SourceFailure] = Field(default_factory=list)
+    errors: list[StoreConflict | SourceFailure | ScholarIssue] = Field(default_factory=list)
 
 
 class UpsertResult(DailyManifest):
-    """Cumulative daily changes, with errors from the current invocation."""
+    """Daily or per-invocation changes, with current source diagnostics."""
 
 
 class IdentifierConflict(ValueError):
@@ -187,7 +187,9 @@ class PaperStore:
         return papers
 
     def upsert(self, incoming: Iterable[Paper], *, day: date, write_daily: bool = True,
-               source_errors: Iterable[SourceFailure] = ()) -> UpsertResult:
+               source_errors: Iterable[SourceFailure | ScholarIssue] = (),
+               error_sources: Iterable[str] | None = None,
+               report_current: bool = False, write_empty_daily: bool = True) -> UpsertResult:
         """Merge a batch and optionally accumulate a daily change manifest.
 
         Identifier upgrades count as updates. A paper first added today stays
@@ -196,6 +198,10 @@ class PaperStore:
         continue. On-disk corruption and I/O errors still fail the operation.
         write_daily=False never reads or writes daily files; returned changes
         then describe this invocation only (used by historical backfill).
+        error_sources replaces only those sources' diagnostics, preserving other
+        writers' errors in the same daily file. report_current returns this
+        invocation's changes while still accumulating the on-disk manifest.
+        write_empty_daily=False skips a new no-op manifest (Scholar replays).
         """
         if type(day) is not date:
             raise TypeError("day must be a datetime.date")
@@ -256,15 +262,22 @@ class PaperStore:
                 key = aliases[key]
             return key
 
-        added = {current_id(key) for key in daily.new}
-        updated = {current_id(key) for key in daily.updated}
+        current_new, current_updated = set(), set()
         for key, paper in papers.items():
             if not origins[key]:
-                added.add(key)
+                current_new.add(key)
             elif origins[key] != {key} or original.get(key) != paper:
-                updated.add(key)
-        # Errors describe the latest attempt. Recovery clears stale failures;
-        # repeating the same failures is byte-identical instead of appending.
+                current_updated.add(key)
+        added = {current_id(key) for key in daily.new} | current_new
+        updated = {current_id(key) for key in daily.updated} | current_updated
+        current_errors = {error.model_dump_json(): error for error in errors}
+        if error_sources is not None:
+            active = set(error_sources)
+            for error in daily.errors:
+                origin = set(error.sources) if isinstance(error, StoreConflict) else {error.source}
+                if not origin.intersection(active):
+                    errors.append(error)
+        # Keep the latest attempt per source, with stable bytes on replay.
         by_error = {error.model_dump_json(): error for error in errors}
         daily = DailyManifest(date=day, new=sorted(added), updated=sorted(updated - added),
                               errors=[by_error[key] for key in sorted(by_error)])
@@ -279,6 +292,9 @@ class PaperStore:
             else:
                 content = b"".join(_json(p.model_dump(mode="json")) for p in sorted(shards[relative], key=lambda p: p.paper_id))
                 _write_if_changed(path, content)
-        if write_daily:
+        if write_daily and (write_empty_daily or daily_path.exists() or daily.new or daily.updated or daily.errors):
             _write_if_changed(daily_path, _json(daily.model_dump(mode="json")))
-        return UpsertResult(**daily.model_dump())
+        return UpsertResult(date=day,
+                            new=sorted(current_new) if report_current else daily.new,
+                            updated=sorted(current_updated) if report_current else daily.updated,
+                            errors=[current_errors[key] for key in sorted(current_errors)])

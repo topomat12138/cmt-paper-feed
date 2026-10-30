@@ -16,3 +16,16 @@ class SourceFailure(BaseModel):
     announced: date | None = None
     category: str | None = None
     paper_ids: list[str] = Field(default_factory=list)
+
+
+class ScholarIssue(BaseModel):
+    """A public dispatch diagnostic without URLs, email or alert provenance."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal["invalid_item", "resolution_failure"]
+    source: Literal["scholar_alert"] = "scholar_alert"
+    stage: Literal["payload", "resolve", "metadata"]
+    message: str
+    item_index: int | None = Field(default=None, ge=0)
+    announced: date | None = None

@@ -40,7 +40,7 @@ class IncompleteMetadataError(SourceError):
 class ListingRef:
     arxiv_id: str
     version: int | None
-    listing_type: ListingType
+    listing_type: ListingType | None
 
     @property
     def query_id(self) -> str:
@@ -110,7 +110,7 @@ def _text(parent: ET.Element, path: str, *, required: bool = False) -> str | Non
     return value or None
 
 
-def parse_metadata(xml: bytes | str, refs: dict[str, ListingRef], *, announced: date, seen_at: datetime) -> list[Paper]:
+def parse_metadata(xml: bytes | str, refs: dict[str, ListingRef], *, announced: date | None, seen_at: datetime) -> list[Paper]:
     """Parse Atom entries; require exactly the requested identifiers."""
     try:
         root = ET.fromstring(xml)
