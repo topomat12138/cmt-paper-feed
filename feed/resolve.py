@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import quote, unquote, urlsplit
 
@@ -47,6 +48,8 @@ class ResolutionResult:
     papers: list[Paper]
     errors: list[ScholarIssue]
     counts: dict[str, int]
+    failed: int = 0
+    routes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -178,7 +181,7 @@ def _work_doi(work: dict) -> str | None:
     return canonical
 
 
-def _work_arxiv(work: dict) -> tuple[str, int | None] | None:
+def _work_arxiv_ids(work: dict) -> dict[str, int | None]:
     locations = work.get("locations") or []
     if not isinstance(locations, list):
         raise SourceError("invalid OpenAlex locations")
@@ -192,7 +195,90 @@ def _work_arxiv(work: dict) -> tuple[str, int | None] | None:
             if match:
                 identifier, version = match
                 matches[identifier] = max(matches.get(identifier) or 0, version or 0) or None
+    return matches
+
+
+def _work_arxiv(work: dict) -> tuple[str, int | None] | None:
+    matches = _work_arxiv_ids(work)
     return next(iter(matches.items())) if len(matches) == 1 else None
+
+
+def _merge_title_works(works: list[dict], *, prefix: bool) -> dict | None:
+    if not works:
+        return None
+    if prefix and len({normalize_title(work.get("title") or work.get("display_name")) for work in works}) != 1:
+        return None
+    arxiv_ids, dois = {}, set()
+    for work in works:
+        for identifier, version in _work_arxiv_ids(work).items():
+            arxiv_ids[identifier] = max(arxiv_ids.get(identifier) or 0, version or 0) or None
+        if (doi := _work_doi(work)) and not doi.startswith("10.48550/arxiv."):
+            dois.add(doi)
+    arxiv = next(iter(arxiv_ids.items())) if len(arxiv_ids) == 1 else None
+    doi = next(iter(dois)) if len(dois) == 1 else None
+    if arxiv is None and doi is None:
+        return None
+    # Prefer the journal work's metadata; only unambiguous identities survive
+    # the union. In particular, do not copy a representative's ambiguous URL.
+    preferred = [work for work in works if doi and _work_doi(work) == doi]
+    ordered = [*preferred, *[work for work in works if work not in preferred]]
+    merged = dict(ordered[0])
+    for name in ("authorships", "abstract_inverted_index", "primary_location"):
+        merged[name] = next((work[name] for work in ordered if work.get(name)), None)
+    merged["doi"] = "https://doi.org/" + doi if doi else None
+    merged["locations"] = [{"landing_page_url": "https://arxiv.org/abs/" + arxiv[0]
+                             + (f"v{arxiv[1]}" if arxiv[1] else "")}] if arxiv else []
+    for name in ("primary_location", "best_oa_location"):
+        location = merged.get(name)
+        merged[name] = ({key: value for key, value in location.items()
+                         if key not in {"landing_page_url", "pdf_url"}} if isinstance(location, dict) else None)
+    return merged
+
+
+def _author_surnames(authors: list[str]) -> set[str]:
+    surnames = set()
+    for author in authors:
+        name = unicodedata.normalize("NFKC", author).strip()
+        if not name:
+            continue
+        family = name.split(",", 1)[0] if "," in name else name.split()[-1]
+        family = normalize_title(family)
+        if len(family) > 1:
+            surnames.add(family)
+    return surnames
+
+
+def link_doi_papers(papers: list[Paper], existing: Iterable[Paper]) -> tuple[list[Paper], set[int]]:
+    """Scholar-only conservative bridge from a journal DOI to a stored arXiv.
+
+    Build the title/surname index once. Strong DOI matches take precedence and
+    competing incoming DOIs cannot claim the same DOI-less arXiv record.
+    """
+    index, known_dois = {}, set()
+    for paper in existing:
+        if paper.doi:
+            known_dois.add(paper.doi)
+        elif paper.arxiv_id:
+            index.setdefault(normalize_title(paper.title), []).append((paper, _author_surnames(paper.authors)))
+    proposals, target_dois = {}, {}
+    for number, paper in enumerate(papers):
+        if paper.arxiv_id or not paper.doi or paper.doi in known_dois:
+            continue
+        surnames = _author_surnames(paper.authors)
+        candidates = [candidate for candidate, names in index.get(normalize_title(paper.title), [])
+                      if surnames & names]
+        if len(candidates) == 1:
+            target = candidates[0]
+            proposals[number] = target
+            target_dois.setdefault(target.paper_id, set()).add(paper.doi)
+    linked, result = set(), list(papers)
+    for number, target in proposals.items():
+        if len(target_dois[target.paper_id]) == 1:
+            values = papers[number].model_dump()
+            values.update(paper_id="", arxiv_id=target.arxiv_id)
+            result[number] = Paper.model_validate(values)
+            linked.add(number)
+    return result, linked
 
 
 def _openalex_paper(work: dict, *, doi: str, seen_at: datetime) -> Paper:
@@ -265,25 +351,18 @@ class Resolver:
         return work
 
     def _openalex_title(self, target: tuple[str, bool]) -> dict | None:
-        data = self._openalex(OPENALEX_URL, {"search": target[0], "per_page": 100})
+        data = self._openalex(OPENALEX_URL, {"filter": "title.search:" + target[0], "per_page": 50})
         if data is None:
             return None
         works = data.get("results")
         if not isinstance(works, list) or any(not isinstance(work, dict) for work in works):
             raise SourceError("invalid OpenAlex search response")
-        meta = data.get("meta") or {}
-        total = meta.get("count") if isinstance(meta, dict) else None
-        if total is not None and (type(total) is not int or total < len(works)):
-            raise SourceError("invalid OpenAlex search result count")
-        if (type(total) is int and total > len(works)) or (total is None and len(works) >= 100):
-            return None
-        matches = {}
-        for index, work in enumerate(works):
+        matches = []
+        for work in works[:50]:
             title = work.get("title") or work.get("display_name")
             if isinstance(title, str) and _matches_title(title, target):
-                key = work.get("id") or _work_doi(work) or f"candidate:{index}"
-                matches[str(key)] = work
-        return next(iter(matches.values())) if len(matches) == 1 else None
+                matches.append(work)
+        return _merge_title_works(matches, prefix=target[1])
 
     def _arxiv_batch(self, refs: dict[str, ListingRef], seen_at: datetime) -> dict[str, Paper]:
         last_xml = None
@@ -335,16 +414,19 @@ class Resolver:
         def issue(index, stage, message):
             errors.append(ScholarIssue(code="resolution_failure", stage=stage, item_index=index, message=message))
 
-        def fallback(index, item):
+        def fallback(index, item, doi=None, route="doi_url"):
             try:
-                papers[index] = Paper(title=item.title, sources=["scholar_alert"],
+                papers[index] = Paper(title=item.title, doi=doi,
+                                      links={"doi": "https://doi.org/" + doi} if doi else {},
+                                      sources=["scholar_alert"],
                                       first_seen=seen_at, last_updated=seen_at)
-                routes[index] = "title_only"
+                routes[index] = route if doi else "title_only"
             except ValueError:
                 errors.append(ScholarIssue(code="invalid_item", stage="payload", item_index=index,
                                            message="title cannot form a paper identity"))
 
         for index, item in enumerate(items):
+            known_doi, known_route = None, "doi_url"
             try:
                 arxiv_matches = [match for url in item.urls if (match := extract_arxiv(url))]
                 if arxiv_matches:
@@ -359,7 +441,7 @@ class Resolver:
                 if len(dois) > 1:
                     raise SourceError("ambiguous DOI links")
                 if dois:
-                    doi = next(iter(dois))
+                    doi = known_doi = next(iter(dois))
                     work = self._doi_work(doi)
                     if work is None:
                         raise SourceError("OpenAlex DOI metadata unavailable")
@@ -388,7 +470,8 @@ class Resolver:
                 work = self._openalex_title(target)
                 if work is not None:
                     arxiv_match = _work_arxiv(work)
-                    doi = _work_doi(work)
+                    doi = known_doi = _work_doi(work)
+                    known_route = "openalex_title"
                     if arxiv_match:
                         pending.append(_Pending(item, index, "openalex_title", *arxiv_match, doi))
                         continue
@@ -398,8 +481,9 @@ class Resolver:
                         continue
                 fallback(index, item)
             except Exception:
-                issue(index, "resolve", "paper resolution failed; retained the public title only")
-                fallback(index, item)
+                issue(index, "resolve", "paper metadata resolution failed; retained the known DOI" if known_doi
+                      else "paper resolution failed; retained the public title only")
+                fallback(index, item, known_doi, known_route)
 
         by_id = {}
         for request in pending:
@@ -419,13 +503,17 @@ class Resolver:
         for request in pending:
             paper = resolved.get(request.arxiv_id)
             if paper is None:
-                issue(request.index, "metadata", "arXiv metadata unavailable; retained the public title only")
-                fallback(request.index, request.item)
+                issue(request.index, "metadata", "arXiv metadata unavailable; retained the known DOI" if request.doi
+                      else "arXiv metadata unavailable; retained the public title only")
+                fallback(request.index, request.item, request.doi, request.route)
                 continue
             if request.doi and not paper.doi:
                 paper = paper.model_copy(update={"doi": request.doi})
             papers[request.index] = paper
             routes[request.index] = request.route
         counts = Counter(routes.values())
+        failures = {error.item_index for error in errors if error.code == "resolution_failure"}
         return ResolutionResult([papers[index] for index in sorted(papers)], errors,
-                                {route: counts[route] for route in _ROUTES})
+                                {route: counts[route] for route in _ROUTES},
+                                failed=sum(routes[index] == "title_only" and index in failures for index in papers),
+                                routes=[routes[index] for index in sorted(papers)])

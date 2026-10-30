@@ -141,14 +141,18 @@ SQLite 索引不提交到 git（二进制文件会让仓库历史膨胀），由
 1. 从 arxiv.org 的 /abs/ 或 /pdf/ URL 提取 arXiv 号，支持版本、.pdf 后缀和旧式 cond-mat/0601001。
 2. 提取 doi.org 或出版商 URL 路径中的 `10.\d{4,9}/...`，去掉末尾 /abstract、/full、/pdf、.pdf 等；Nature /articles/<slug> 映射为 10.1038/<slug>。APS 新式短 DOI、Wiley /doi/abs|full|pdf/ 和 IOP 都要支持；ScienceDirect 的 pii 不当作 DOI。
 3. 用 arXiv API 的 ti 短语查询回查标题，沿用 PR 2 的限速/重试，仅接受归一化标题完全相等的唯一候选。
-4. 用 OpenAlex /works?search=... 回查标题，User-Agent 只写仓库 URL、不带邮箱；仅接受归一化标题完全相等的唯一候选，取 DOI 及 locations 中的 arXiv 号。
+4. 用 OpenAlex `/works?filter=title.search:<归一化标题>&per_page=50` 回查标题，User-Agent 只写仓库 URL、不带邮箱。检查前 50 条中的归一化标题完全相等候选，不因 meta.count 大于已返回条数而放弃。同标题的预印本/正式版 work 合并标识：locations 中的 arXiv 号须唯一，期刊 DOI 须唯一（排除 `10.48550/arXiv.*`）；仅保留唯一的标识，两者都不唯一时放弃。
 5. 均未命中时保留 title: 记录，仅有公开标题和 sources=["scholar_alert"]。
 
-标题以 … 或 ... 结尾时，第 3、4 步改为归一化前缀匹配，但截断前内容至少 60 字符，且候选仍须唯一。无法完整查看的搜索结果不能用来猜测唯一候选。
+标题以 … 或 ... 结尾时，第 3、4 步改为归一化前缀匹配，但截断前内容至少 60 字符，且须对应唯一完整归一化标题。arXiv 未完整返回的搜索结果不能用来猜测唯一候选；OpenAlex 按上述前 50 条规则处理。
 
-拿到 arXiv 号后复用现有批量元数据接口（每批至多 100、请求至少间隔 3 秒、最多 3 次尝试），生成完整 Paper，listing_type 和 announced 留 null。只有 DOI 时用 OpenAlex 元数据的标题、作者、abstract_inverted_index 还原摘要和期刊名组装 Paper，links 只放 canonical DOI。Crossref 后备可选，本 PR 不要求。
+拿到 arXiv 号后复用现有批量元数据接口（每批至多 100、请求至少间隔 3 秒、最多 3 次尝试），生成完整 Paper，listing_type 和 announced 留 null。只有 DOI 时用 OpenAlex 元数据的标题、作者、abstract_inverted_index 还原摘要和期刊名组装 Paper，links 只放 canonical DOI。已知 DOI 的元数据请求失败或返回 404 时保留 DOI、输入标题和 canonical DOI 链接，记录 resolution_failure，不退化为 title:。Crossref 后备可选，本 PR 不要求。
+
+Scholar 的 DOI-only 记录写入前，若已有记录中恰好有一条 arXiv 记录同时满足归一化标题完全相等、至少一位作者姓氏相同、自身没有 DOI，则关联到该 arXiv 记录，计数为 doi_title_link；其他情况维持原合并规则。已有 DOI 强匹配优先，多个不同 DOI 不能同时认领同一条无 DOI 的 arXiv 记录。通用存储不对已识别记录仅按标题合并。
 
 所有输入记录的 sources 仅为 ["scholar_alert"]，再复用既有合并逻辑；已有 arxiv_listing 记录增加来源，计作本次 updated。外部失败按条目隔离，退回 title: 或记录安全错误，不影响其他成功论文；不请求 payload 中任意 URL，不保留其查询串。
+
+所有诊断仍写入 daily 和计数报告。后续步骤成功解析或保住 DOI 时不因 resolution_failure 单独标红；输入不合法、因失败退化为 title-only、存储失败或标识冲突仍返回非零。以上解析细化按 PR 6 的 Claude 审查意见更新。
 
 **daily 与验收**
 

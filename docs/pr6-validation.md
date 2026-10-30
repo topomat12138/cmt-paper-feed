@@ -6,7 +6,7 @@ The script and email reading are outside this repository and this PR.
 
 ## Offline acceptance
 
-- **368 tests pass, 1 real-model smoke defaults to skipped.** The socket guard
+- **392 tests pass, 1 real-model smoke defaults to skipped.** The socket guard
   remains enabled. All Scholar payloads and HTTP responses are artificial;
   httpx.MockTransport supplies arXiv/OpenAlex responses. No real email, alert
   content, mailbox credential or model download is used by tests.
@@ -16,7 +16,9 @@ The script and email reading are outside this repository and this PR.
   suffixes do not enter canonical links.
 - Exact and ambiguous arXiv/OpenAlex title matches, both long-title truncation
   suffixes, the 60-character threshold and OpenAlex prefix ambiguity are covered.
-  Incomplete result pages cannot establish uniqueness.
+  Incomplete arXiv result pages cannot establish uniqueness. OpenAlex checks
+  the first 50 title.search results regardless of meta.count, combining unique
+  arXiv/journal identities across same-title works and rejecting ambiguous IDs.
 - arXiv metadata is batched at at most 100 IDs with the existing three-second
   spacing/shared three-attempt retry policy. Partial feeds retry and salvage
   valid members. Duplicate conflicting members are not guessed. Other valid
@@ -27,6 +29,16 @@ The script and email reading are outside this repository and this PR.
 - CLI tests execute both GitHub event formats and local input modes, verify
   count-only reports, UTC weekend daily files, arXiv source unions, preservation
   of existing announcement metadata, per-invocation update counts and ID upgrades.
+- Known DOI records survive OpenAlex 404, exhausted HTTP retries, mismatched
+  metadata, malformed remote text and unavailable arXiv location metadata.
+  Safe diagnostics remain, but an established DOI is never discarded.
+- Scholar-only title/surname linking adds a DOI to one eligible DOI-less arXiv
+  record, merges sources, reports an update and remains byte-stable on replay.
+  Different/missing authors, different titles, ambiguous candidates, existing
+  DOIs and competing incoming DOIs cannot cause an unsafe title merge.
+- CLI tests distinguish recoverable diagnostics from failures: a recovered
+  OpenAlex lookup or retained DOI succeeds; invalid input, failed title-only
+  fallbacks and current store conflicts still return nonzero.
 - Replaying identical metadata five minutes later or on the next UTC date
   changes no paper or daily bytes. A no-op does not create a new empty daily.
 - Per-source diagnostics preserve another writer's failures/conflicts. Recovery
@@ -60,6 +72,59 @@ payload bodies, triggering authors or alert labels. Command reports contain only
 counts, including error_counts. Fatal storage errors do not emit a publishable
 report, so partial storage failures cannot be committed with fabricated counts.
 
+## Live acceptance on the owner's Mac
+
+Run at **2026-10-30 03:12:21 UTC**, outside pytest, using the owner's ten public
+previewLatest title/link items. The payload and generated data remain in
+`/private/tmp`, outside the repository. No production dispatch or data push was
+performed. The Python CLI entry point ran against an empty temporary store;
+the actual `.venv/bin/feed scholar --data-dir <temporary store> --items-json ...`
+executable then replayed exactly the same input.
+
+First run: **10 stored, 10 new, 0 updated, 9/10 identified**, elapsed **3.085 s**.
+Both commands exited 0, with no diagnostics. The resolution report was:
+
+```json
+{
+  "arxiv_url": 5,
+  "doi_url": 4,
+  "arxiv_title": 0,
+  "openalex_title": 0,
+  "title_only": 1,
+  "doi_title_link": 0
+}
+```
+
+Final paper_id prefixes, in the original supplied order:
+
+| Item | Link format | Final prefix |
+| --- | --- | --- |
+| 1 | ScienceDirect PII | title: |
+| 2 | Wiley /doi/abs/ | doi: |
+| 3 | APS short DOI | doi: |
+| 4 | arXiv pdf | arxiv: |
+| 5 | APS short DOI | doi: |
+| 6 | arXiv pdf | arxiv: |
+| 7 | arXiv pdf | arxiv: |
+| 8 | Nature articles | arxiv: |
+| 9 | arXiv pdf | arxiv: |
+| 10 | arXiv pdf | arxiv: |
+
+The ScienceDirect item's arXiv and OpenAlex title lookups returned no exact
+match; it correctly remains title-only. This is a search miss, not a transport
+failure. All nine other items received strong identities. Route counts reflect
+the input resolution path: a DOI URL can ultimately yield an arXiv paper_id.
+
+The new real OpenAlex title.search query returned HTTP success and zero works
+for item 1. An independent positive check using item 8 returned three works and
+the resolver established both a unique arXiv ID and journal DOI. Thus the live
+check exercises title.search in addition to the URL DOI path used by ingestion.
+
+The replay reported **new=0, updated=0**. SHA-256 maps of **all two generated
+files** before/after the executable replay were identical. Local evidence is
+`/private/tmp/cmt-pr6-live-validation.json`; it contains counts and prefixes,
+not the input titles/URLs. No real items became test fixtures.
+
 The shared title normalizer removes TeX math delimiters $_{} so MnBi₂Te₄ and
 MnBi$_2$Te$_4$ share an identity. The inspected data snapshot
 `83c851d711c5d50fce2d8001a43d274364ec2800` has 2898 identified papers and zero
@@ -78,6 +143,12 @@ title-only records, so no existing title identity requires migration there.
   rejected rather than breaking the batch.
 - OpenAlex requests use the keyless endpoint with a 0.1-second request-start
   interval and bounded retries. Crossref is optional and is not added.
+- Claude's PR 6 review refines the original search contract: OpenAlex uses a
+  title-only filter and the first 50 results, combines same-title work identities,
+  and excludes arXiv-minted DOIs from journal DOI selection. A shared author
+  surname plus exact title may bridge one DOI-only item to a DOI-less arXiv.
+  Known DOIs survive metadata failures, and recoverable resolution warnings do
+  not fail an identified record. README and the PR 6 specification agree.
 - Store options report current-call changes while keeping cumulative manifests,
   scope error replacement to each source, and omit newly empty no-op manifests.
   Paper field names and daily date/new/updated/errors fields are unchanged.
@@ -128,6 +199,7 @@ These are public, independent examples, verified against
 5. Confirm **Paper embeddings** is triggered after Scholar ingest completes and
    fills missing/changed hashes through its existing independent workflow.
 
-If an external API is unavailable, title-only fallbacks and error_counts are
-expected; resolve the reported source error and rerun before considering the
-full metadata lookup test complete. Live rollout is not claimed by offline tests.
+If an external API is unavailable, a known DOI is retained with error_counts;
+items without one may fall back to title-only and fail the run. Resolve the
+reported source error and rerun before considering full metadata lookup
+complete. Production Actions rollout remains a post-merge check.

@@ -19,7 +19,7 @@ from feed.errors import ScholarIssue
 from feed.schema import Paper, normalize_title
 from feed.sources.base import Source, SourceResult, register
 
-_RESOLUTION_KINDS = ("arxiv_url", "doi_url", "arxiv_title", "openalex_title", "title_only")
+_RESOLUTION_KINDS = ("arxiv_url", "doi_url", "arxiv_title", "openalex_title", "title_only", "doi_title_link")
 _GOOGLE_HOST = re.compile(r"(?:scholar\.)?google\.[a-z0-9]+(?:\.[a-z0-9-]+)*", re.IGNORECASE)
 
 
@@ -59,10 +59,11 @@ class ScholarAlert(Source):
             resolver = Resolver(client=client, sleep=sleep, clock=clock)
         self.resolver = resolver
         self.stats = self._empty_stats()
+        self.routes: list[str] = []
 
     @staticmethod
     def _empty_stats() -> dict:
-        return {"received": 0, "valid": 0, "deduplicated": 0,
+        return {"received": 0, "valid": 0, "deduplicated": 0, "failed": 0,
                 "resolution_counts": {kind: 0 for kind in _RESOLUTION_KINDS}}
 
     def fetch(self, *, seen_at: datetime, day: date | None = None) -> SourceResult:
@@ -73,6 +74,7 @@ class ScholarAlert(Source):
         observed = seen_at.astimezone(timezone.utc)
         dates = (observed.date(),)
         self.stats = self._empty_stats()
+        self.routes = []
         payload = self.payload
         if isinstance(payload, dict) and isinstance(payload.get("items"), list):
             self.stats["received"] = len(payload["items"])
@@ -122,6 +124,8 @@ class ScholarAlert(Source):
             papers = [Paper(title=item.title, sources=["scholar_alert"], first_seen=observed,
                             last_updated=observed) for item in items]
             self.stats["resolution_counts"]["title_only"] = len(papers)
+            self.stats["failed"] = len(papers)
+            self.routes = ["title_only"] * len(papers)
             errors.append(ScholarIssue(code="resolution_failure", stage="resolve",
                                        message="metadata resolution failed; retained title-only records"))
             return SourceResult(dates, papers, errors)
@@ -129,6 +133,8 @@ class ScholarAlert(Source):
             count = result.counts.get(kind, 0)
             if type(count) is int and count >= 0:
                 self.stats["resolution_counts"][kind] = count
+        self.stats["failed"] = result.failed
+        self.routes = result.routes
         papers = [paper.model_copy(update={"sources": ["scholar_alert"], "announced": None,
                                            "listing_type": None}) for paper in result.papers]
         return SourceResult(dates, papers, [*errors, *result.errors])

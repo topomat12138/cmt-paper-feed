@@ -6,8 +6,9 @@ import httpx
 import pytest
 
 from feed.resolve import (
-    OPENALEX_URL, ResolveItem, Resolver, extract_arxiv, extract_doi, reconstruct_abstract,
+    OPENALEX_URL, ResolveItem, Resolver, extract_arxiv, extract_doi, link_doi_papers, reconstruct_abstract,
 )
+from feed.schema import Paper
 from feed.sources.arxiv_listing import API_URL, NS, USER_AGENT
 
 SEEN = datetime(2026, 11, 1, 1, 30, tzinfo=timezone.utc)
@@ -225,8 +226,9 @@ def test_openalex_exact_match_builds_allowlisted_doi_metadata():
         if request.url.host == "export.arxiv.org":
             return httpx.Response(200, content=atom())
         assert request.url.path == "/works"
-        assert request.url.params["search"] == title.lower()
-        assert request.url.params["per_page"] == "100"
+        assert request.url.params["filter"] == "title.search:" + title.lower()
+        assert request.url.params["per_page"] == "50"
+        assert "search" not in request.url.params
         return httpx.Response(200, json={"meta": {"count": 1}, "results": [work(title=title)]})
 
     result, calls = resolve(handler, [ResolveItem(title, ("https://www.sciencedirect.com/science/article/pii/S0577907326003874",))])
@@ -269,16 +271,17 @@ def test_openalex_location_arxiv_is_fetched_and_known_doi_is_retained():
     assert result.counts["openalex_title"] == 1
 
 
-def test_incomplete_search_pages_cannot_establish_unique_title_match():
+def test_openalex_first_page_exact_match_is_accepted_despite_a_large_result_count():
     title = "An artificial title"
 
     def handler(request):
         if request.url.host == "export.arxiv.org":
             return httpx.Response(200, content=atom([{"id": "2610.10001v1", "title": title}], total=2))
-        return httpx.Response(200, json={"meta": {"count": 2}, "results": [work(title=title)]})
+        return httpx.Response(200, json={"meta": {"count": 4200}, "results": [work(title=title)]})
 
     result, calls = resolve(handler, [ResolveItem(title)])
-    assert result.counts["title_only"] == 1
+    assert result.counts["openalex_title"] == 1
+    assert result.papers[0].paper_id == "doi:10.1234/example"
     assert all("id_list" not in request.url.params for _, request in calls)
 
 
@@ -338,7 +341,7 @@ def test_failed_remote_item_falls_back_without_losing_other_papers_or_leaking_da
         ResolveItem("A public journal title", ("https://publisher.example/10.1234/unavailable?tracking=secret",)),
         ResolveItem("A public arXiv title", ("https://arxiv.org/abs/2610.10001",)),
     ])
-    assert len(result.papers) == 2 and result.papers[0].paper_id.startswith("title:")
+    assert len(result.papers) == 2 and result.papers[0].paper_id == "doi:10.1234/unavailable"
     assert result.papers[1].paper_id == "arxiv:2610.10001"
     assert len([request for _, request in calls if request.url.host == "api.openalex.org"]) == 3
     serialized = json.dumps([paper.model_dump(mode="json") for paper in result.papers])
@@ -351,7 +354,7 @@ def test_failed_remote_item_falls_back_without_losing_other_papers_or_leaking_da
 def test_openalex_must_return_the_requested_doi():
     result, _ = resolve(lambda request: httpx.Response(200, json=work(doi="10.1234/wrong")),
                         [ResolveItem("A public title", ("https://doi.org/10.1234/requested",))])
-    assert result.papers[0].paper_id.startswith("title:")
+    assert result.papers[0].paper_id == "doi:10.1234/requested"
     assert result.errors[0].code == "resolution_failure"
 
 
@@ -411,6 +414,130 @@ def test_unserializable_openalex_metadata_falls_back_without_losing_other_items(
 
     result, _ = resolve(handler, [ResolveItem("A valid supplied title", ("https://doi.org/10.1234/example",)),
                                   ResolveItem("Another valid item", ("https://arxiv.org/abs/2610.10001",))])
-    assert result.papers[0].paper_id.startswith("title:")
+    assert result.papers[0].paper_id == "doi:10.1234/example"
     assert result.papers[1].paper_id == "arxiv:2610.10001"
     assert result.errors[0].code == "resolution_failure"
+
+
+@pytest.mark.parametrize("status", [404, 503])
+def test_known_doi_survives_missing_metadata_with_a_diagnostic(status):
+    title, doi = "A public supplied title", "10.1103/safe-1234"
+    result, calls = resolve(lambda request: httpx.Response(status),
+                            [ResolveItem(title, ("https://link.aps.org/pdf/" + doi,))])
+    paper = result.papers[0]
+    assert paper.paper_id == "doi:" + doi and paper.title == title
+    assert paper.links == {"doi": "https://doi.org/" + doi}
+    assert paper.authors == [] and paper.abstract is None
+    assert paper.sources == ["scholar_alert"] and paper.announced is paper.listing_type is None
+    assert result.errors[0].code == "resolution_failure"
+    assert result.counts["doi_url"] == 1 and result.counts["title_only"] == result.failed == 0
+    assert len(calls) == (1 if status == 404 else 3)
+
+
+@pytest.mark.parametrize("via_title", [False, True])
+def test_known_doi_survives_arxiv_location_metadata_failure(via_title):
+    title = "A synthetic paper with a missing arXiv response"
+
+    def handler(request):
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=atom())
+        matched = work(title=title, locations=[{"landing_page_url": "https://arxiv.org/abs/2610.10001"}])
+        return httpx.Response(200, json={"results": [matched]} if via_title else matched)
+
+    result, _ = resolve(handler, [ResolveItem(title, () if via_title else ("https://doi.org/10.1234/example",))])
+    assert result.papers[0].paper_id == "doi:10.1234/example"
+    assert result.counts["openalex_title" if via_title else "doi_url"] == 1
+    assert result.failed == 0 and result.errors[0].stage == "metadata"
+
+
+@pytest.mark.parametrize("arxiv_ids,journal_dois,expected,doi", [
+    (["2610.10001", "2610.10001"], ["10.1234/journal"], "arxiv:2610.10001", "10.1234/journal"),
+    (["2610.10001", "2610.10002"], ["10.1234/journal"], "doi:10.1234/journal", "10.1234/journal"),
+    (["2610.10001"], ["10.1234/one", "10.1234/two"], "arxiv:2610.10001", None),
+    (["2610.10001", "2610.10002"], ["10.1234/one", "10.1234/two"], "title:", None),
+])
+def test_openalex_combines_same_title_preprint_and_journal_identities(arxiv_ids, journal_dois, expected, doi):
+    title = "An artificial preprint and journal title"
+    works = [work(title=title, identifier=f"Wpre{number}", doi="10.48550/arXiv." + identifier,
+                  locations=[{"pdf_url": f"https://arxiv.org/pdf/{identifier}v2.pdf"}])
+             for number, identifier in enumerate(arxiv_ids)]
+    works += [work(title=title.upper(), identifier=f"Wjournal{number}", doi=value)
+              for number, value in enumerate(journal_dois)]
+    # Also test that an ambiguous representative's primary URL cannot escape
+    # the combined identity decision when only the journal DOI is unique.
+    works[0]["primary_location"]["landing_page_url"] = "https://arxiv.org/abs/" + arxiv_ids[0]
+
+    def handler(request):
+        if "search_query" in request.url.params:
+            return httpx.Response(200, content=atom())
+        if request.url.host == "api.openalex.org":
+            return httpx.Response(200, json={"meta": {"count": 5000}, "results": works})
+        return httpx.Response(200, content=atom([{"id": "2610.10001v2", "title": title}]))
+
+    result, _ = resolve(handler, [ResolveItem(title)])
+    assert result.papers[0].paper_id.startswith(expected)
+    assert result.papers[0].doi == doi
+    assert result.errors == [] and result.failed == 0
+
+
+def test_openalex_never_uses_candidates_beyond_the_requested_fifty():
+    title = "A synthetic fifty result boundary"
+
+    def handler(request):
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=atom())
+        candidates = [work(title="Unrelated title", identifier=f"W{number}") for number in range(50)]
+        return httpx.Response(200, json={"results": [*candidates, work(title=title)]})
+
+    result, _ = resolve(handler, [ResolveItem(title)])
+    assert result.papers[0].paper_id.startswith("title:")
+
+
+def paper(**values):
+    return Paper(title="Chiral superconductivity in a synthetic material", sources=["scholar_alert"],
+                 first_seen=SEEN, last_updated=SEEN, **values)
+
+
+def test_scholar_doi_title_link_requires_matching_surname_and_keeps_canonical_identity():
+    existing = paper(arxiv_id="2610.10001", authors=["Ada Example", "Other Person"])
+    incoming = paper(doi="10.1234/journal", authors=["EXAMPLE, A."])
+    incoming = incoming.model_copy(update={"title": incoming.title.upper()})
+    result, linked = link_doi_papers([incoming], [existing])
+    assert linked == {0}
+    assert result[0].paper_id == existing.paper_id
+    assert result[0].arxiv_id == existing.arxiv_id and result[0].doi == incoming.doi
+    assert result[0].authors == incoming.authors
+    assert incoming.arxiv_id is None and existing.doi is None
+
+
+@pytest.mark.parametrize("case", ["different_authors", "no_authors", "different_title", "ambiguous", "has_doi"])
+def test_scholar_doi_title_link_refuses_unsafe_matches(case):
+    stored = paper(arxiv_id="2610.10001", authors=["Ada Example"])
+    incoming = paper(doi="10.1234/journal", authors=["Another Example"])
+    if case == "different_authors":
+        incoming = incoming.model_copy(update={"authors": ["Different Person"]})
+    elif case == "no_authors":
+        incoming = incoming.model_copy(update={"authors": []})
+    elif case == "different_title":
+        incoming = incoming.model_copy(update={"title": "Another synthetic title"})
+    elif case == "has_doi":
+        stored = stored.model_copy(update={"doi": "10.1234/already-linked"})
+    existing = [stored]
+    if case == "ambiguous":
+        existing.append(paper(arxiv_id="2610.10002", authors=["Third Example"]))
+    result, linked = link_doi_papers([incoming], existing)
+    assert result == [incoming] and linked == set()
+
+
+def test_scholar_doi_title_link_does_not_override_an_existing_strong_doi_match():
+    incoming = paper(doi="10.1234/journal", authors=["Ada Example"])
+    stored = [incoming, paper(arxiv_id="2610.10001", authors=incoming.authors)]
+    result, linked = link_doi_papers([incoming], stored)
+    assert result == [incoming] and linked == set()
+
+
+def test_competing_dois_cannot_claim_one_arxiv_record():
+    incoming = [paper(doi="10.1234/one", authors=["Ada Example"]),
+                paper(doi="10.1234/two", authors=["Ada Example"])]
+    result, linked = link_doi_papers(incoming, [paper(arxiv_id="2610.10001", authors=["Ada Example"])])
+    assert result == incoming and linked == set()

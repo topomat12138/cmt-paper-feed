@@ -147,8 +147,8 @@ uv run --no-sync feed scholar --data-dir /path/to/data-checkout --items-json '[{
 `--payload` accepts a GitHub event, a versioned payload or an items array. The
 manual Actions input `items_json` is decoded inside the process from the event
 file; it is never copied into a workflow shell expression or environment value.
-The report contains only integer counts: received, valid, deduplicated, new,
-updated, resolution_counts and error_counts. It has no item titles, URLs or IDs.
+The report contains only integer counts: received, valid, deduplicated, failed,
+new, updated, resolution_counts and error_counts. It has no item titles, URLs or IDs.
 
 Resolution prefers URL arXiv IDs, then URL DOIs, exact normalized arXiv title
 matches, exact normalized OpenAlex title matches, then title-only records.
@@ -156,8 +156,14 @@ arXiv abs/pdf/versioned/legacy IDs, APS short DOIs, Wiley and IOP DOI paths,
 and Nature article slugs are supported. ScienceDirect PII paths require title
 lookup. Long titles ending in … or ... use a unique prefix match only when the
 visible part is at least 60 characters; short truncated titles stay unresolved.
-Incomplete search pages cannot establish uniqueness. Chemical TeX delimiters
-are removed so MnBi₂Te₄ and MnBi$_2$Te$_4$ normalize identically.
+Incomplete arXiv search pages cannot establish uniqueness. OpenAlex uses
+`filter=title.search:<normalized title>` and checks the first 50 results even
+when meta.count is larger. Same-title preprint/journal works contribute a
+unique arXiv location and a unique journal DOI (excluding 10.48550/arXiv.*).
+If only one identity is unique, only that identity is retained; if neither is
+unique, the match is rejected. Truncated prefixes must identify one full
+normalized title. Chemical TeX delimiters are removed so MnBi₂Te₄ and
+MnBi$_2$Te$_4$ normalize identically.
 
 Only fixed arXiv/OpenAlex API endpoints are requested, with the repository URL
 as User-Agent and no email or API token. arXiv lookups and metadata share PR 2's
@@ -167,9 +173,19 @@ kept; ambiguous duplicate entries are not guessed. OpenAlex metadata supplies
 DOI records, authors, reconstructed abstracts and journal names. Sources are
 `["scholar_alert"]`; announced and listing_type are null in incoming records.
 Existing data uses the normal merge rules and accumulates both source names.
+Before storing a DOI-only Scholar record, an indexed lookup can link it to an
+existing arXiv record without a DOI when exactly one record has the same
+normalized title and a shared author surname. This route is counted as
+doi_title_link. Missing/different authors or ambiguous matches keep separate
+records; an existing DOI match takes precedence.
 
-Remote failures retain title-only records and safe diagnostics while preserving
-successful items. The command writes the run's UTC daily file, including on
+Remote failures preserve a known DOI with the supplied title and canonical DOI
+link even if metadata is unavailable. Otherwise they retain title-only records.
+Safe diagnostics are kept in both cases. A recovered lookup or partial DOI
+record does not fail the command; invalid input, failed title-only fallbacks,
+storage errors and identifier conflicts still fail. The failed count measures
+title-only fallbacks caused by resolution failures.
+The command writes the run's UTC daily file, including on
 weekends, and accumulates existing new/updated IDs. Diagnostics are replaced per
 source so Scholar and arXiv cannot erase one another's errors. Command counts
 describe this invocation; replaying the same payload changes no bytes, including

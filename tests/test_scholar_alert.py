@@ -1,12 +1,12 @@
 import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from feed.errors import ScholarIssue
+from feed.resolve import ResolutionResult
 from feed.schema import Paper
 from feed.sources.base import get_source
 from feed.sources.scholar_alert import ScholarAlert
@@ -22,10 +22,10 @@ class FakeResolver:
 
     def resolve(self, items, *, seen_at):
         self.calls.append((items, seen_at))
-        return SimpleNamespace(
+        return ResolutionResult(
             papers=[Paper(title=item.title, sources=["scholar_alert"], first_seen=seen_at,
                           last_updated=seen_at) for item in items],
-            errors=[], counts={"title_only": len(items)})
+            errors=[], counts={"title_only": len(items)}, routes=["title_only"] * len(items))
 
 
 @pytest.fixture
@@ -47,9 +47,9 @@ def test_registration_and_synthetic_dispatch_validation(client, capsys):
     assert len(result.papers) == 3
     assert [error.code for error in result.errors] == ["invalid_item"]
     assert result.errors[0].item_index == 4
-    assert source.stats == {"received": 5, "valid": 4, "deduplicated": 1,
+    assert source.stats == {"received": 5, "valid": 4, "deduplicated": 1, "failed": 0,
                             "resolution_counts": {"arxiv_url": 0, "doi_url": 0, "arxiv_title": 0,
-                                                  "openalex_title": 0, "title_only": 3}}
+                                                  "openalex_title": 0, "title_only": 3, "doi_title_link": 0}}
     items, observed = resolver.calls[0]
     assert observed == SEEN
     assert any(item.urls == ("https://arxiv.org/abs/2610.99901v2",) for item in items)

@@ -115,7 +115,7 @@ def test_all_input_modes_write_weekend_records_and_report_only_counts(tmp_path, 
     report = json.loads(captured.out)
     assert report["new"] == 2 and report["updated"] == 0
     assert report["resolution_counts"] == {"arxiv_url": 1, "doi_url": 1, "arxiv_title": 0,
-                                            "openalex_title": 0, "title_only": 0}
+                                            "openalex_title": 0, "title_only": 0, "doi_title_link": 0}
     assert report["error_counts"] == {} and report["received"] == report["valid"] == 2
     assert_only_counts(report)
     papers = PaperStore(root).load()
@@ -178,7 +178,7 @@ def test_invalid_items_and_remote_failures_do_not_lose_successful_records(tmp_pa
     report = json.loads(captured.out)
     assert report["new"] == 2 and report["valid"] == 2
     assert report["error_counts"] == {"invalid_item": 1, "resolution_failure": 1}
-    assert report["resolution_counts"]["arxiv_url"] == report["resolution_counts"]["title_only"] == 1
+    assert report["resolution_counts"]["arxiv_url"] == report["resolution_counts"]["doi_url"] == 1
     assert_only_counts(report)
     assert len(PaperStore(root).load()) == 2
     daily = DailyManifest.model_validate_json((root / "daily/2026-10-31.json").read_bytes())
@@ -306,3 +306,76 @@ def test_scholar_keeps_existing_arxiv_conflicts_until_arxiv_recovers(tmp_path, r
     assert DailyManifest.model_validate_json(path.read_bytes()).errors[0].code == "identifier_conflict"
     store.upsert([], day=SEEN.date(), error_sources={"arxiv_listing"})
     assert DailyManifest.model_validate_json(path.read_bytes()).errors == []
+
+
+@pytest.mark.parametrize("same_author", [False, True])
+def test_journal_doi_links_only_a_unique_same_title_same_surname_arxiv(tmp_path, runtime, capsys, same_author):
+    root = tmp_path / "data"
+    store = PaperStore(root)
+    existing = Paper(arxiv_id=ARXIV, title=ITEMS[1]["title"].upper(),
+                     authors=["Another Author" if same_author else "Different Person"],
+                     sources=["arxiv_listing"], first_seen=SEEN - timedelta(days=1),
+                     announced=date(2026, 10, 29), listing_type="new")
+    store.upsert([existing], day=SEEN.date() - timedelta(days=1))
+    args = ["scholar", "--data-dir", str(root), "--items-json", json.dumps(ITEMS[1:])]
+    assert cli.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert_only_counts(report)
+    assert report["resolution_counts"]["doi_title_link"] == int(same_author)
+    assert report["resolution_counts"]["doi_url"] == int(not same_author)
+    assert report["new"] == int(not same_author) and report["updated"] == int(same_author)
+    papers = store.load()
+    if same_author:
+        assert set(papers) == {existing.paper_id}
+        merged = papers[existing.paper_id]
+        assert merged.doi == DOI and merged.sources == ["arxiv_listing", "scholar_alert"]
+        assert merged.first_seen == existing.first_seen and merged.announced == existing.announced
+        assert merged.links["doi"] == "https://doi.org/" + DOI
+    else:
+        assert set(papers) == {existing.paper_id, "doi:" + DOI}
+        assert papers[existing.paper_id].doi is None
+    before = snapshot(root)
+    assert cli.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["new"] == report["updated"] == 0 and snapshot(root) == before
+
+
+@pytest.mark.parametrize("case,expected_status", [
+    ("known_doi", 0), ("recovered_title_lookup", 0), ("failed_title_only", 1), ("unmatched_title", 0),
+])
+def test_recoverable_diagnostics_do_not_fail_identified_records(tmp_path, runtime, capsys, case, expected_status):
+    _, handler, _ = runtime
+    title = ITEMS[1]["title"]
+
+    def respond_to_case(request):
+        if request.url.host == "export.arxiv.org":
+            return (httpx.Response(200, content=f'<feed xmlns="{NS["atom"]}"/>')
+                    if case == "unmatched_title" else httpx.Response(503))
+        if case == "recovered_title_lookup":
+            metadata = json.loads(respond(httpx.Request("GET", f"https://api.openalex.org/works/https://doi.org/{DOI}")).content)
+            return httpx.Response(200, json={"meta": {"count": 3000}, "results": [metadata]})
+        if case == "unmatched_title":
+            return httpx.Response(200, json={"results": []})
+        return httpx.Response(404 if case == "known_doi" else 503)
+
+    handler["reply"] = respond_to_case
+    item = ITEMS[1] if case == "known_doi" else {"title": title}
+    assert cli.main(["scholar", "--data-dir", str(tmp_path), "--items-json", json.dumps([item])]) == expected_status
+    report = json.loads(capsys.readouterr().out)
+    assert report["failed"] == int(case == "failed_title_only")
+    assert report["error_counts"] == ({} if case == "unmatched_title" else
+                                      {"resolution_failure": 2 if case == "failed_title_only" else 1})
+    paper = next(iter(PaperStore(tmp_path).load().values()))
+    assert paper.paper_id.startswith("title:" if case in {"failed_title_only", "unmatched_title"} else "doi:")
+    daily = DailyManifest.model_validate_json((tmp_path / "daily/2026-10-31.json").read_bytes())
+    assert len(daily.errors) == sum(report["error_counts"].values())
+
+
+def test_current_scholar_store_conflict_still_fails_without_overwriting_record(tmp_path, runtime, capsys):
+    existing = Paper(arxiv_id=ARXIV, title=TITLE, doi="10.1234/existing", sources=["arxiv_listing"], first_seen=SEEN)
+    store = PaperStore(tmp_path)
+    store.upsert([existing], day=SEEN.date())
+    runtime[1]["reply"] = lambda request: httpx.Response(200, content=atom(doi="10.1234/conflicting"))
+    assert cli.main(["scholar", "--data-dir", str(tmp_path), "--items-json", json.dumps(ITEMS[:1])]) == 1
+    assert json.loads(capsys.readouterr().out)["error_counts"] == {"identifier_conflict": 1}
+    assert store.load() == {existing.paper_id: existing}

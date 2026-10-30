@@ -14,6 +14,7 @@ from feed.backfill import DEFAULT_END, DEFAULT_START, BackfillError, backfill
 from feed.config import load_config
 from feed.errors import SourceFailure
 from feed.ingest import ingest_sources
+from feed.resolve import link_doi_papers
 from feed.sources import ScholarAlert, get_source
 from feed.store import PaperStore
 
@@ -74,8 +75,13 @@ def _scholar(args) -> int:
         with httpx.Client(timeout=60, follow_redirects=True) as client:
             source = ScholarAlert(payload=_scholar_payload(args), client=client)
             fetched = source.fetch(seen_at=seen_at)
-        result = PaperStore(args.data_dir).upsert(
-            fetched.papers, day=day, source_errors=fetched.errors,
+        store = PaperStore(args.data_dir)
+        papers, linked = link_doi_papers(fetched.papers, store.load().values())
+        for number in linked:
+            source.stats["resolution_counts"][source.routes[number]] -= 1
+        source.stats["resolution_counts"]["doi_title_link"] = len(linked)
+        result = store.upsert(
+            papers, day=day, source_errors=fetched.errors,
             error_sources={"scholar_alert"}, report_current=True, write_empty_daily=False)
     except Exception:
         # Do not expose event text, HTTP exceptions or filesystem identities.
@@ -87,9 +93,9 @@ def _scholar(args) -> int:
               "error_counts": dict(sorted(Counter(error.code for error in result.errors).items()))}
     print(json.dumps(report, sort_keys=True))
     if result.errors:
-        print(f"scholar completed with {len(result.errors)} input or resolution errors; successful records were stored",
+        print(f"scholar completed with {len(result.errors)} diagnostics; resolved records were stored",
               file=sys.stderr)
-    return 1 if result.errors else 0
+    return int(source.stats["failed"] > 0 or any(error.code != "resolution_failure" for error in result.errors))
 
 
 def main(argv: list[str] | None = None) -> int:
