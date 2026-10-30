@@ -135,6 +135,7 @@ SQLite 索引不提交到 git（二进制文件会让仓库历史膨胀），由
 
 - version 严格为整数 1；items 必须是列表且至多 200 条。标题必须为 1–1000 字符的非空字符串；URL 仅允许 null 或至多 2000 字符、以 http/https 开头的字符串。非法条目跳过并记录 `invalid_item`，不能拖垮整批。
 - scholar.google.* / google.* 主机的 URL 视为 null。同批归一化标题相同的条目合并；论文标题中的 Unicode 下标和 LaTeX 数学定界符应归一化为相同文本，如 MnBi₂Te₄ 与 MnBi$_2$Te$_4$。
+- 标题匹配另用 `normalize_title` 结果去掉所有空白的比较键，使 Scholar 插入空格的化学式能匹配 arXiv 的紧凑写法。arXiv/OpenAlex 的精确/前缀比较、Scholar 批内去重和 DOI 关联、store 标题索引统一使用此键，仍执行原有唯一性/歧义检查。`normalize_title` 和 `paper_id` 的生成规则不变，不迁移已有 ID。
 
 **解析顺序（resolve.py，每步命中就停）**
 

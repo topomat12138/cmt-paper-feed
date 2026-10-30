@@ -139,6 +139,18 @@ def test_unicode_and_latex_chemical_titles_deduplicate(client):
     assert len(resolver.calls[0][0]) == 1
 
 
+def test_scholar_formula_whitespace_variants_deduplicate_without_changing_title_ids(client):
+    resolver = FakeResolver()
+    source = ScholarAlert(payload={"version": 1, "items": [
+        {"title": "Synthetic Ag $ *3 $ LiRh $ 2 $ O $ 6$ paper"},
+        {"title": "Synthetic Ag$3$LiRh$2$O$6$ paper"},
+    ]}, client=client, resolver=resolver)
+    result = source.fetch(seen_at=SEEN)
+    assert source.stats["valid"] == 2 and source.stats["deduplicated"] == 1
+    assert len(resolver.calls[0][0]) == len(result.papers) == 1
+    assert result.errors == []
+
+
 def test_payload_extras_and_url_tracking_are_not_retained(client, capsys):
     resolver = FakeResolver()
     source = ScholarAlert(payload={"version": 1, "alert_name": "private-alert", "email": "private@example.org",

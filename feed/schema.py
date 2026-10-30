@@ -29,6 +29,16 @@ def normalize_title(title: str) -> str:
     return " ".join(text.lower().split())
 
 
+def title_match_key(title: str) -> str:
+    """Compare title variants without whitespace; never use this for IDs.
+
+    Scholar may insert spaces inside TeX chemical formulas. Keep the original
+    normalized text for title identities and API queries, and relax only the
+    comparison key used to match candidates and build title indexes.
+    """
+    return "".join(normalize_title(title).split())
+
+
 def make_paper_id(*, arxiv_id: str | None, doi: str | None, title: str) -> str:
     """Build an ID from canonical identifiers, in arXiv/DOI/title order."""
     if arxiv_id:

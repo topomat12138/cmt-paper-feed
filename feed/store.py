@@ -17,7 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from feed.schema import Paper, normalize_title
+from feed.schema import Paper, title_match_key
 from feed.errors import ScholarIssue, SourceFailure
 
 
@@ -103,7 +103,7 @@ class _PaperIndex:
     def add(self, paper: Paper) -> None:
         if paper.doi:
             self.by_doi[paper.doi].add(paper.paper_id)
-        title = normalize_title(paper.title)
+        title = title_match_key(paper.title)
         self.by_title[title].add(paper.paper_id)
         self.title_keys[paper.paper_id] = title
         if paper.paper_id.startswith("title:"):
@@ -133,7 +133,7 @@ class _PaperIndex:
             matched.update(self.by_doi.get(paper.doi, ()))
         titles = self.by_title if paper.paper_id.startswith("title:") else self.unresolved_by_title
         if titles:
-            matched.update(titles.get(normalize_title(paper.title), ()))
+            matched.update(titles.get(title_match_key(paper.title), ()))
         return matched
 
 
@@ -253,6 +253,9 @@ class PaperStore:
                     del papers[key]
                     if key != paper.paper_id:
                         aliases[key] = paper.paper_id
+            # Whitespace-only weak-title variants have different title IDs.
+            # A later merge can revisit one; a stored ID is no longer an alias.
+            aliases.pop(paper.paper_id, None)
             papers[paper.paper_id] = paper
             origins[paper.paper_id] = previous_ids
             index.add(paper)

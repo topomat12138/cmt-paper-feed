@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from feed.errors import ScholarIssue
-from feed.schema import Paper, normalize_title
+from feed.schema import Paper, title_match_key
 from feed.sources.base import Source, SourceResult, register
 
 _RESOLUTION_KINDS = ("arxiv_url", "doi_url", "arxiv_title", "openalex_title", "title_only", "doi_title_link")
@@ -96,7 +96,7 @@ class ScholarAlert(Source):
                     raise ValueError("invalid title")
                 title = title.strip()
                 title.encode("utf-8")
-                key = normalize_title(title)
+                key = title_match_key(title)
                 if not key:
                     raise ValueError("title has no searchable text")
                 url = _public_url(item.get("url"))

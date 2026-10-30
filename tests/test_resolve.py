@@ -541,3 +541,57 @@ def test_competing_dois_cannot_claim_one_arxiv_record():
                 paper(doi="10.1234/two", authors=["Ada Example"])]
     result, linked = link_doi_papers(incoming, [paper(arxiv_id="2610.10001", authors=["Ada Example"])])
     assert result == incoming and linked == set()
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_arxiv_title_comparison_ignores_scholar_formula_spaces_but_still_requires_unique_id(ambiguous):
+    supplied = "Synthetic magnetism in Ag $ *3 $ LiRh $ 2 $ O $ 6$"
+    compact = "Synthetic magnetism in Ag$3$LiRh$2$O$*6$"
+
+    def handler(request):
+        if request.url.host == "api.openalex.org":
+            return httpx.Response(200, json={"results": []})
+        entries = [{"id": "2610.10001v1", "title": compact}]
+        if "search_query" in request.url.params:
+            assert request.url.params["search_query"] == 'ti:"synthetic magnetism in ag 3 lirh 2 o 6"'
+            if ambiguous:
+                entries.append({"id": "2610.10002v1", "title": supplied})
+        # The real XML parser decodes the numeric entity before title matching.
+        response = atom(entries).replace(b"O$*6$", b"O$*&#x36;$")
+        return httpx.Response(200, content=response)
+
+    result, calls = resolve(handler, [ResolveItem(supplied)])
+    assert result.papers[0].paper_id.startswith("title:" if ambiguous else "arxiv:2610.10001")
+    assert result.counts["title_only" if ambiguous else "arxiv_title"] == 1
+    assert result.errors == []
+    if ambiguous:
+        assert all("id_list" not in request.url.params for _, request in calls)
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_openalex_title_comparison_and_work_union_ignore_formula_spaces(truncated):
+    prefix = "A synthetic extended study of electronic magnetism and crystal order in "
+    supplied = prefix + "Ag $ *3 $ LiRh $ 2 $ O $ 6$"
+    compact = prefix + "Ag$3$LiRh$2$O$6$"
+
+    def handler(request):
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=atom())
+        return httpx.Response(200, json={"results": [
+            work(title=compact, doi="10.1234/journal", identifier="W1"),
+            work(title=supplied, doi="10.1234/journal", identifier="W2"),
+        ]})
+
+    result, _ = resolve(handler, [ResolveItem(supplied + ("…" if truncated else ""))])
+    assert result.papers[0].paper_id == "doi:10.1234/journal"
+    assert result.counts["openalex_title"] == 1 and result.errors == []
+
+
+def test_scholar_doi_title_link_uses_whitespace_comparison_key():
+    existing = paper(arxiv_id="2610.10001", authors=["Ada Example"]).model_copy(
+        update={"title": "Synthetic Ag$3$LiRh$2$O$6$ magnetism"})
+    incoming = paper(doi="10.1234/journal", authors=["EXAMPLE, A."]).model_copy(
+        update={"title": "Synthetic Ag $ *3 $ LiRh $ 2 $ O $ 6$ magnetism"})
+    result, linked = link_doi_papers([incoming], [existing])
+    assert linked == {0}
+    assert result[0].paper_id == existing.paper_id and result[0].doi == incoming.doi

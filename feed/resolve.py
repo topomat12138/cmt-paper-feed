@@ -19,7 +19,7 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 
 from feed.errors import ScholarIssue
-from feed.schema import Paper, normalize_title
+from feed.schema import Paper, normalize_title, title_match_key
 from feed.sources.arxiv_listing import (
     API_URL, NS, USER_AGENT, ArxivListing, IncompleteMetadataError,
     ListingRef, _identifier, parse_metadata,
@@ -116,8 +116,9 @@ def _title_target(title: str) -> tuple[str, bool] | None:
 
 
 def _matches_title(candidate: str, target: tuple[str, bool]) -> bool:
-    candidate = normalize_title(candidate)
+    candidate = title_match_key(candidate)
     value, prefix = target
+    value = title_match_key(value)
     return candidate.startswith(value) if prefix else candidate == value
 
 
@@ -206,7 +207,7 @@ def _work_arxiv(work: dict) -> tuple[str, int | None] | None:
 def _merge_title_works(works: list[dict], *, prefix: bool) -> dict | None:
     if not works:
         return None
-    if prefix and len({normalize_title(work.get("title") or work.get("display_name")) for work in works}) != 1:
+    if prefix and len({title_match_key(work.get("title") or work.get("display_name")) for work in works}) != 1:
         return None
     arxiv_ids, dois = {}, set()
     for work in works:
@@ -259,13 +260,13 @@ def link_doi_papers(papers: list[Paper], existing: Iterable[Paper]) -> tuple[lis
         if paper.doi:
             known_dois.add(paper.doi)
         elif paper.arxiv_id:
-            index.setdefault(normalize_title(paper.title), []).append((paper, _author_surnames(paper.authors)))
+            index.setdefault(title_match_key(paper.title), []).append((paper, _author_surnames(paper.authors)))
     proposals, target_dois = {}, {}
     for number, paper in enumerate(papers):
         if paper.arxiv_id or not paper.doi or paper.doi in known_dois:
             continue
         surnames = _author_surnames(paper.authors)
-        candidates = [candidate for candidate, names in index.get(normalize_title(paper.title), [])
+        candidates = [candidate for candidate, names in index.get(title_match_key(paper.title), [])
                       if surnames & names]
         if len(candidates) == 1:
             target = candidates[0]

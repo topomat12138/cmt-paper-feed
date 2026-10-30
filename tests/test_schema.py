@@ -3,7 +3,7 @@ import hashlib
 import pytest
 from pydantic import ValidationError
 
-from feed.schema import Paper, normalize_title
+from feed.schema import Paper, normalize_title, title_match_key
 
 
 def test_contract_round_trip(paper):
@@ -61,6 +61,23 @@ def test_title_identity_hashes_normalized_utf8(paper):
     second = paper(arxiv_id=None, arxiv_version=None, title="bcs theory")
     expected = hashlib.sha1(b"bcs theory").hexdigest()[:12]
     assert first.paper_id == second.paper_id == f"title:{expected}"
+
+
+@pytest.mark.parametrize("spaced", [
+    "Ag $ *3 $ LiRh $ 2 $ O $ 6$",
+    "Ag\t$ _3 $\nLiRh\u00a0$ 2 $\u202fO\u2003$ 6$",
+])
+def test_comparison_key_ignores_formula_whitespace_without_changing_ids(paper, spaced):
+    compact = "Ag$3$LiRh$2$O$6$"
+    assert normalize_title(spaced) == "ag 3 lirh 2 o 6"
+    assert normalize_title(compact) == "ag3lirh2o6"
+    assert title_match_key(spaced) == title_match_key(compact) == "ag3lirh2o6"
+    first = paper(arxiv_id=None, arxiv_version=None, title=spaced)
+    second = paper(arxiv_id=None, arxiv_version=None, title=compact)
+    # Existing title IDs still hash the whitespace-preserving normalized text.
+    assert first.paper_id == "title:" + hashlib.sha1(b"ag 3 lirh 2 o 6").hexdigest()[:12]
+    assert second.paper_id == "title:" + hashlib.sha1(b"ag3lirh2o6").hexdigest()[:12]
+    assert first.paper_id != second.paper_id
 
 
 @pytest.mark.parametrize("kind", ["new", "cross", "replacement", None])

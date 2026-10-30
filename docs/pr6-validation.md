@@ -6,7 +6,7 @@ The script and email reading are outside this repository and this PR.
 
 ## Offline acceptance
 
-- **392 tests pass, 1 real-model smoke defaults to skipped.** The socket guard
+- **405 tests pass, 1 real-model smoke defaults to skipped.** The socket guard
   remains enabled. All Scholar payloads and HTTP responses are artificial;
   httpx.MockTransport supplies arXiv/OpenAlex responses. No real email, alert
   content, mailbox credential or model download is used by tests.
@@ -39,6 +39,14 @@ The script and email reading are outside this repository and this PR.
 - CLI tests distinguish recoverable diagnostics from failures: a recovered
   OpenAlex lookup or retained DOI succeeds; invalid input, failed title-only
   fallbacks and current store conflicts still return nonzero.
+- A separate whitespace-free title comparison key handles Scholar's spaced TeX
+  formulas in arXiv/OpenAlex matches, prefix candidate unions, batch deduplication,
+  the title/surname bridge and store indexes. Tests cover XML numeric entities,
+  Unicode whitespace, unique/ambiguous candidates, promotion in either order,
+  same-batch matching and byte-stable replay, including weak-title alias cycles.
+  The index's work remains linear.
+  Existing title ID hashes still include normalized word spaces; neither the
+  normalizer nor the paper_id generation algorithm changes.
 - Replaying identical metadata five minutes later or on the next UTC date
   changes no paper or daily bytes. A no-op does not create a new empty daily.
 - Per-source diagnostics preserve another writer's failures/conflicts. Recovery
@@ -149,6 +157,9 @@ title-only records, so no existing title identity requires migration there.
   surname plus exact title may bridge one DOI-only item to a DOI-less arXiv.
   Known DOIs survive metadata failures, and recoverable resolution warnings do
   not fail an identified record. README and the PR 6 specification agree.
+- The owner's follow-up adds the whitespace-free comparison key only for title
+  matching. It does not change the normalized query text, identity hashes or
+  the restrictions on merging identified records. No stored ID migration occurs.
 - Store options report current-call changes while keeping cumulative manifests,
   scope error replacement to each source, and omit newly empty no-op manifests.
   Paper field names and daily date/new/updated/errors fields are unchanged.

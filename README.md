@@ -165,6 +165,13 @@ unique, the match is rejected. Truncated prefixes must identify one full
 normalized title. Chemical TeX delimiters are removed so MnBi₂Te₄ and
 MnBi$_2$Te$_4$ normalize identically.
 
+Title comparisons also use a whitespace-free key after the existing
+normalization, so Scholar's `Ag $ *3 $ LiRh $ 2 $ O $ 6$` can match
+`Ag$3$LiRh$2$O$6$`. arXiv/OpenAlex exact and prefix comparisons, Scholar batch
+deduplication, the title/surname DOI bridge and store title indexes share this
+key. Ambiguity checks still apply. `normalize_title` and the whitespace-preserving
+title hash used to generate paper_id are unchanged; existing IDs need no migration.
+
 Only fixed arXiv/OpenAlex API endpoints are requested, with the repository URL
 as User-Agent and no email or API token. arXiv lookups and metadata share PR 2's
 three-second spacing, three-attempt retry budget and batches of at most 100 IDs.
