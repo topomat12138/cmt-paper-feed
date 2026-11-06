@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from feed.cli import main
 from feed.config import load_config
 from feed.sources import ArxivListing, SourceError, get_source
-from feed.sources.arxiv_listing import ListingRef, NS, parse_listing, parse_metadata
+from feed.sources.arxiv_listing import ListingRef, NS, parse_listing, parse_metadata, parse_pastweek
 from feed.store import PaperStore
 
 FIXTURES = Path(__file__).parent / "fixtures/arxiv/2026-10-28"
@@ -37,15 +37,37 @@ def recording(name):
     return (FIXTURES / name).read_bytes()
 
 
+def synthetic_pastweek(days):
+    """A past-week page in arXiv's layout from {heading date: [(id, cross)]}."""
+    total = sum(len(entries) for entries in days.values())
+    parts = [f"<html><body><div id='dlpage'><div class='paging'>Total of {total} entries</div><dl id='articles'>"]
+    for day, entries in days.items():
+        parts.append(f"<h3>{day.strftime('%a')}, {day.day} {day.strftime('%b %Y')} (showing {len(entries)} of {len(entries)} entries )</h3>")
+        for key, cross in entries:
+            note = " (cross-list from cond-mat.str-el)" if cross else ""
+            parts.append(f'<dt><a href ="/abs/{key}" title="Abstract" id="{key}">arXiv:{key}</a>{note}</dt><dd></dd>')
+    parts.append("</dl></div></body></html>")
+    return "".join(parts)
+
+
+def pastweek_from_new(category):
+    """The recorded day as the past-week page shows it: new and cross, no replacements."""
+    page = parse_listing(recording(f"{category}.html").decode())
+    return synthetic_pastweek({page.announced: [(ref.arxiv_id, ref.listing_type == "cross")
+                                                for ref in page.entries if ref.listing_type != "replacement"]})
+
+
 def replay(request):
     if request.url.host == "arxiv.org":
-        category = request.url.path.split("/")[2]
+        _, _, category, kind = request.url.path.split("/")
+        if kind == "pastweek":
+            return httpx.Response(200, text=pastweek_from_new(category))
         return httpx.Response(200, content=recording(f"{category}.html"))
     assert request.url.host == "export.arxiv.org"
     return httpx.Response(200, content=recording("api-000.xml"))
 
 
-def source(handler=replay, categories=CATEGORIES):
+def source(handler=replay, categories=CATEGORIES, **options):
     clock = Clock()
     calls = []
 
@@ -54,7 +76,7 @@ def source(handler=replay, categories=CATEGORIES):
         return handler(request)
 
     client = httpx.Client(transport=httpx.MockTransport(transport))
-    return ArxivListing(categories=categories, client=client, clock=clock.clock, sleep=clock.sleep), client, calls
+    return ArxivListing(categories=categories, client=client, clock=clock.clock, sleep=clock.sleep, **options), client, calls
 
 
 def snapshot(root):
@@ -407,6 +429,8 @@ def test_cli_optional_date_mismatch_writes_only_diagnostics(tmp_path, monkeypatc
 def test_cli_empty_page_uses_page_date_for_empty_manifest(tmp_path, monkeypatch, capsys):
     def handler(request):
         assert request.url.host == "arxiv.org"
+        if request.url.path.endswith("/pastweek"):
+            return httpx.Response(200, text=synthetic_pastweek({}))
         return httpx.Response(200, text=synthetic_listing([]))
 
     install_cli_transport(monkeypatch, handler)
@@ -418,6 +442,8 @@ def test_cli_empty_page_uses_page_date_for_empty_manifest(tmp_path, monkeypatch,
 
 def test_categories_with_different_page_dates_write_separate_manifests(tmp_path, monkeypatch, capsys):
     def handler(request):
+        if request.url.path.endswith("/pastweek"):
+            return replay(request)
         if request.url.host == "arxiv.org":
             category = request.url.path.split("/")[2]
             html = recording(f"{category}.html").decode()
@@ -534,3 +560,153 @@ def test_source_initialization_failure_is_recorded_without_raw_details(tmp_path,
     assert report["errors"][0]["stage"] == "source"
     assert "missing.yml" not in json.dumps(report)
     assert json.loads((tmp_path / "data/daily/2026-10-28.json").read_bytes())["errors"] == report["errors"]
+
+
+PASTWEEK = Path(__file__).parent / "fixtures/arxiv/pastweek"
+NOV3 = date(2026, 11, 3)
+
+
+def pastweek_recording(category):
+    return (PASTWEEK / f"{category}.html").read_text(encoding="utf-8")
+
+
+def synthetic_api(request):
+    """Atom entries for exactly the requested IDs, built from one recorded entry."""
+    template = ET.fromstring(recording("api-000.xml")).find("atom:entry", NS)
+    feed = ET.Element(f"{{{NS['atom']}}}feed")
+    for key in request.url.params["id_list"].split(","):
+        entry = copy.deepcopy(template)
+        entry.find("atom:id", NS).text = f"http://arxiv.org/abs/{key}v1"
+        feed.append(entry)
+    return httpx.Response(200, content=ET.tostring(feed))
+
+
+def test_recorded_pastweek_page_keeps_every_day():
+    days = parse_pastweek(pastweek_recording("cond-mat.supr-con"))
+    assert [(day.isoformat(), len(refs)) for day, refs in days.items()] == [
+        ("2026-11-05", 6), ("2026-11-04", 5), ("2026-11-03", 11), ("2026-11-02", 5), ("2026-10-30", 26)]
+    assert {ref.listing_type for refs in days.values() for ref in refs} == {"new", "cross"}
+    assert sum(ref.listing_type == "cross" for refs in days.values() for ref in refs) == 19
+    mes_hall = parse_pastweek(pastweek_recording("cond-mat.mes-hall"))
+    assert len(mes_hall[NOV3]) == 56
+
+
+@pytest.mark.parametrize("damage", ["container", "heading", "partial", "total"])
+def test_bad_or_incomplete_pastweek_fails_closed(damage):
+    html = pastweek_recording("cond-mat.supr-con")
+    if damage == "container":
+        html = "<html>upstream unavailable</html>"
+    elif damage == "heading":
+        html = html.replace("Tue, 3 Nov 2026", "Tue, 3 Nov")
+    elif damage == "partial":
+        html = html.replace("showing 11 of 11", "showing 10 of 11")
+    else:
+        html = html.replace("Total of 53 entries", "Total of 54 entries")
+    with pytest.raises(SourceError):
+        parse_pastweek(html)
+
+
+def test_catch_up_recovers_only_unknown_earlier_entries():
+    """A day the daily page never showed (stale CDN copy) comes back from the past week."""
+    pages = {category: parse_pastweek(pastweek_recording(category)) for category in CATEGORIES}
+    missed = {ref.arxiv_id for days in pages.values() for ref in days[NOV3]}
+    everything = {ref.arxiv_id for days in pages.values() for refs in days.values() for ref in refs}
+
+    def handler(request):
+        if request.url.host == "export.arxiv.org":
+            return synthetic_api(request)
+        _, _, category, kind = request.url.path.split("/")
+        if kind == "pastweek":
+            return httpx.Response(200, text=pastweek_recording(category))
+        return replay(request)
+
+    known = (everything - missed) | {ref.arxiv_id for c in CATEGORIES for ref in parse_listing(recording(f"{c}.html").decode()).entries}
+    adapter, client, calls = source(handler, catch_up=True, known_ids=known)
+    with client:
+        fetched = adapter.fetch(seen_at=SEEN)
+    assert fetched.errors == []
+    assert fetched.announcement_dates == (DAY, NOV3)
+    recovered = {p.arxiv_id: p for p in fetched.papers if p.announced == NOV3}
+    assert set(recovered) == missed
+    expected_cross = {ref.arxiv_id for days in pages.values() for ref in days[NOV3] if ref.listing_type == "cross"}
+    expected_cross -= {ref.arxiv_id for days in pages.values() for ref in days[NOV3] if ref.listing_type == "new"}
+    assert {key for key, p in recovered.items() if p.listing_type == "cross"} == expected_cross
+    assert all(b[0] - a[0] >= 3 for a, b in zip(calls, calls[1:]))
+
+
+def test_listing_requests_bypass_the_cdn_cache():
+    tokens = iter(["101", "102", "103", "104"])
+    adapter, client, calls = source(catch_up=True, cache_token=lambda: next(tokens))
+    with client:
+        assert adapter.fetch(seen_at=SEEN).errors == []
+    listing = [req.url for _, req in calls if req.url.host == "arxiv.org"]
+    assert [(url.path.rsplit("/", 1)[1], url.params["_"]) for url in listing] == [
+        ("new", "101"), ("new", "102"), ("pastweek", "103"), ("pastweek", "104")]
+    assert all(url.params["show"] == "2000" for url in listing)
+
+
+def test_failed_category_is_retried_after_a_pause_and_reason_is_recorded():
+    failures = {"cond-mat.supr-con": 3, "cond-mat.mes-hall": 6}
+
+    def handler(request):
+        category = request.url.path.split("/")[2] if request.url.host == "arxiv.org" else None
+        if category and request.url.path.endswith("/new") and failures[category]:
+            failures[category] -= 1
+            return httpx.Response(503, text="private upstream response")
+        return synthetic_api(request) if request.url.host == "export.arxiv.org" else replay(request)
+
+    adapter, client, calls = source(handler)
+    with client:
+        fetched = adapter.fetch(seen_at=SEEN)
+    # supr-con recovers on the second pass; mes-hall fails both passes.
+    assert {p.arxiv_id for p in fetched.papers} == {
+        ref.arxiv_id for ref in parse_listing(recording("cond-mat.supr-con.html").decode()).entries}
+    assert [(e.category, e.message) for e in fetched.errors] == [
+        ("cond-mat.mes-hall", "arXiv listing fetch or validation failed (HTTP 503)")]
+    gaps = [b[0] - a[0] for a, b in zip(calls, calls[1:])]
+    assert max(gaps) >= 60
+
+
+def test_invalid_listing_page_is_retried():
+    attempts = {"count": 0}
+
+    def handler(request):
+        if request.url.host == "arxiv.org" and CATEGORIES[1] in request.url.path and attempts["count"] < 2:
+            attempts["count"] += 1
+            return httpx.Response(200, text="<html>upstream unavailable</html>")
+        return replay(request)
+
+    adapter, client, _ = source(handler)
+    with client:
+        fetched = adapter.fetch(seen_at=SEEN)
+    assert fetched.errors == [] and len(fetched.papers) == 53
+
+
+def test_cli_catch_up_skips_stored_papers_and_fills_the_missed_day(tmp_path, monkeypatch, capsys):
+    missed_day = {"on": False}
+
+    def handler(request):
+        if not missed_day["on"]:
+            return replay(request)
+        if request.url.host == "export.arxiv.org":
+            return synthetic_api(request)
+        if request.url.path.endswith("/pastweek"):
+            return httpx.Response(200, text=synthetic_pastweek({date(2026, 10, 27): [("2610.30001", False), ("2610.30002", True)]}))
+        return replay(request)
+
+    install_cli_transport(monkeypatch, handler)
+    args = ["ingest", "--config", str(CONFIG), "--data-dir", str(tmp_path)]
+    assert main(args) == 0
+    before = snapshot(tmp_path)
+    assert main(args) == 0  # the past week only repeats stored papers
+    assert snapshot(tmp_path) == before
+    capsys.readouterr()
+
+    missed_day["on"] = True
+    assert main(args) == 0
+    reports = json.loads(capsys.readouterr().out)["announcements"]
+    assert [(r["date"], r["fetched"]) for r in reports] == [("2026-10-27", 2), ("2026-10-28", 53)]
+    missed = json.loads((tmp_path / "daily/2026-10-27.json").read_bytes())
+    assert missed["new"] == ["arxiv:2610.30001", "arxiv:2610.30002"] and missed["errors"] == []
+    stored = PaperStore(tmp_path).load()
+    assert stored["arxiv:2610.30002"].listing_type == "cross" and stored["arxiv:2610.30002"].announced == date(2026, 10, 27)

@@ -159,13 +159,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if result.errors else 0
     try:
         seen_at = datetime.now(timezone.utc)
+        # arXiv IDs already stored; the past-week catch-up fetches only the rest.
+        known_ids = {paper.arxiv_id for paper in PaperStore(args.data_dir).load().values() if paper.arxiv_id}
         with ExitStack() as stack:
             sources, setup_errors = {}, []
             try:
                 config = load_config(args.config, embedding=False)
                 client = stack.enter_context(httpx.Client(timeout=60, follow_redirects=True))
                 sources["arxiv_listing"] = get_source("arxiv_listing")(
-                    categories=config.sources.arxiv_listing.categories, client=client)
+                    categories=config.sources.arxiv_listing.categories, client=client,
+                    catch_up=True, known_ids=known_ids)
             except Exception:
                 setup_errors.append(SourceFailure(source="arxiv_listing", stage="source", announced=args.date,
                                                   message="source initialization failed"))
