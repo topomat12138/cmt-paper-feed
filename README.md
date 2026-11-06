@@ -70,12 +70,28 @@ is known, diagnostics use the checked date, or the run's UTC date. Unknown-date
 failures accompany any known announcement dates discovered by other sources.
 The command prints only structured paper counts/dates and errors.
 
-`/new` only exposes the latest announcement, so at least one successful run
-between consecutive announcements is still required. Arbitrary historical
-listing replay is not implemented in this PR.
+arXiv's CDN can serve a `/list` page for up to about a day after it was cached,
+so a page cached just before an announcement can hide a whole day (2026-11-03
+was missed this way). Every listing request therefore carries a per-run `_=`
+query value, which is always a cache miss. Listing pages that fail, including
+pages that fail validation, get three attempts, and a category that still
+fails is tried once more after a 60-second pause. Listing diagnostics name the
+reason: a fixed validation message, an HTTP status, `timeout` or `network error`.
+
+`/new` only exposes the latest announcement. The default run (no `--date`) also
+reads `https://arxiv.org/list/<category>/pastweek?show=2000`, which lists the
+new and cross-listed entries of the last five announcements by day. Entries
+whose arXiv ID is not in the store and not on the current `/new` pages are
+fetched and stored with that day as `announced`, in that day's
+`daily/<date>.json`. So a day missed by a stale page or a failed run is
+recovered by any later run within five announcements. Replacements are not on
+that page and are not recovered. Papers already stored are never refetched, so
+the catch-up leaves stored bytes unchanged when nothing was missed.
 
 Recorded HTML and XML for 2026-10-28 are in
-[`tests/fixtures/arxiv/2026-10-28`](tests/fixtures/arxiv/2026-10-28).
+[`tests/fixtures/arxiv/2026-10-28`](tests/fixtures/arxiv/2026-10-28). Past-week
+pages recorded on 2026-11-06 (announcements 2026-10-30 to 2026-11-05) are in
+[`tests/fixtures/arxiv/pastweek`](tests/fixtures/arxiv/pastweek).
 The two pages contain 38 and 17 entries across all three sections, with
 53 unique IDs after deduplication. Tests use `httpx.MockTransport`; a suite-wide
 socket guard prevents accidental live network access. Batch-boundary and error

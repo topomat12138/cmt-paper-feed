@@ -13,7 +13,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Literal, TypeVar
+from typing import Iterable, Literal, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
@@ -28,6 +28,11 @@ NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/
 API_URL = "https://export.arxiv.org/api/query"
 USER_AGENT = "cmt-paper-feed/0.1 (https://github.com/topomat12138/cmt-paper-feed)"
 _PRIORITY = {"new": 0, "cross": 1, "replacement": 2}
+_PAST_DAY = re.compile(r"^[A-Z][a-z]{2}, (?P<day>\d{1,2} [A-Z][a-z]{2} \d{4}) \(showing (?P<shown>\d+) of (?P<total>\d+) entries\s*\)$")
+# arXiv's CDN keeps /list pages for up to a day, so a page cached just before
+# an announcement is served long after it. A per-run query value is a cache miss.
+CACHE_PARAM = "_"
+RETRY_PAUSE = 60.0
 _ID = re.compile(r"(?P<id>\d{4}\.\d{4,5}|[A-Za-z.-]+/\d{7})(?:v(?P<version>[1-9]\d*))?")
 _T = TypeVar("_T")
 
@@ -102,6 +107,63 @@ def parse_listing(html: str) -> ListingPage:
     return ListingPage(announced, tuple(entries), dict(counts))
 
 
+def parse_pastweek(html: str) -> dict[date, tuple[ListingRef, ...]]:
+    """Parse the past-week page: new and cross-listed entries per announcement day.
+
+    The page omits replacements. Every day section and the page total must be
+    complete, the same fail-closed checks as the daily page.
+    """
+    root = BeautifulSoup(html, "html.parser").select_one("#dlpage")
+    if root is None:
+        raise SourceError("arXiv past-week container missing")
+    total = re.search(r"Total of\s+(\d+)\s+entries", root.get_text(" ", strip=True))
+    if not total:
+        raise SourceError("arXiv past-week total missing")
+    days: dict[date, list[ListingRef]] = {}
+    expected: dict[date, int] = {}
+    current = None
+    count = 0
+    for node in root.find_all(["h3", "dt"]):
+        if node.name == "h3":
+            match = _PAST_DAY.match(" ".join(node.get_text(" ", strip=True).split()))
+            if not match:
+                raise SourceError("arXiv past-week day heading is invalid")
+            if match["shown"] != match["total"]:
+                raise SourceError("arXiv past-week day is incomplete")
+            try:
+                current = datetime.strptime(match["day"], "%d %b %Y").date()
+            except ValueError as error:
+                raise SourceError("arXiv past-week day heading is invalid") from error
+            if current in days:
+                raise SourceError("arXiv past-week repeats a day")
+            days[current], expected[current] = [], int(match["total"])
+            continue
+        anchor = node.select_one('a[title="Abstract"]')
+        if current is None or anchor is None or not anchor.get("href"):
+            raise SourceError("arXiv past-week entry is missing its day or identifier")
+        identifier, version = _identifier(anchor["href"])
+        kind = "cross" if "cross-list from" in node.get_text(" ", strip=True) else "new"
+        days[current].append(ListingRef(identifier, version, kind))
+        count += 1
+    if count != int(total[1]) or any(len(days[key]) != value for key, value in expected.items()):
+        raise SourceError("arXiv past-week counts do not match its entries")
+    return {key: tuple(value) for key, value in days.items()}
+
+
+def failure_reason(error: BaseException) -> str:
+    """A short public reason: fixed source messages or HTTP status, never response text."""
+    cause = error.__cause__ if isinstance(error, SourceError) and error.__cause__ is not None else error
+    if isinstance(cause, httpx.HTTPStatusError):
+        return f"HTTP {cause.response.status_code}"
+    if isinstance(cause, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(cause, httpx.HTTPError):
+        return "network error"
+    if isinstance(error, SourceError):
+        return str(error)
+    return type(error).__name__
+
+
 def _text(parent: ET.Element, path: str, *, required: bool = False) -> str | None:
     node = parent.find(path, NS)
     value = " ".join("".join(node.itertext()).split()) if node is not None else ""
@@ -159,10 +221,20 @@ def parse_metadata(xml: bytes | str, refs: dict[str, ListingRef], *, announced: 
 class ArxivListing(Source):
     def __init__(self, *, categories: list[str], client: httpx.Client,
                  sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 catch_up: bool = False, known_ids: Iterable[str] = (),
+                 cache_token: Callable[[], str] | None = None):
+        """catch_up also reads each category's past-week page and returns the
+        new/cross entries of earlier announcements that are not in known_ids
+        (unversioned arXiv IDs already stored), so a day missed by a stale or
+        failed daily page is recovered on a later run. Replacements are not on
+        that page and are not recovered."""
         self.categories = sorted(set(categories))
         self.client = client
         self.sleep, self.clock = sleep, clock
+        self.catch_up = catch_up
+        self.known_ids = frozenset(known_ids)
+        self.cache_token = cache_token or (lambda: str(int(time.time())))
         self._last_request: float | None = None
 
     def _get(self, url: str, params: dict, parse: Callable[[httpx.Response], _T]) -> _T:
@@ -176,7 +248,9 @@ class ArxivListing(Source):
                 response = self.client.get(url, params=params, headers={"User-Agent": USER_AGENT})
                 response.raise_for_status()
                 return parse(response)
-            except IncompleteMetadataError:
+            except SourceError:
+                # Includes incomplete Atom feeds and listing pages that fail
+                # validation, which a CDN or upstream hiccup can produce.
                 if attempt == 2:
                     raise
             except httpx.HTTPError as error:
@@ -184,32 +258,76 @@ class ArxivListing(Source):
                     raise SourceError("arXiv request failed after three attempts") from error
         raise AssertionError("unreachable")
 
+    def _page(self, category: str, kind: str, parse: Callable[[str], _T]) -> _T:
+        return self._get(f"https://arxiv.org/list/{category}/{kind}",
+                         {"show": 2000, CACHE_PARAM: self.cache_token()}, lambda response: parse(response.text))
+
+    def _pages(self, kind: str, parse: Callable[[str], _T]) -> tuple[dict[str, _T], dict[str, BaseException]]:
+        """Fetch every category, then retry the failed ones once after a pause."""
+        pages, failed = {}, {}
+        for category in self.categories:
+            try:
+                pages[category] = self._page(category, kind, parse)
+            except Exception as error:
+                failed[category] = error
+        if failed:
+            self.sleep(RETRY_PAUSE)
+            for category in sorted(failed):
+                try:
+                    pages[category] = self._page(category, kind, parse)
+                    del failed[category]
+                except Exception as error:
+                    failed[category] = error
+        return pages, failed
+
     def fetch(self, *, seen_at: datetime, day: date | None = None) -> SourceResult:
         refs: dict[str, ListingRef] = {}
         dates_by_id: dict[str, date] = {}
         announcement_dates = set()
         errors = []
+
+        def add(ref: ListingRef, announced: date) -> None:
+            old = refs.get(ref.arxiv_id)
+            if old and announced < dates_by_id[ref.arxiv_id]:
+                return
+            if old and announced == dates_by_id[ref.arxiv_id]:
+                kind = min((old.listing_type, ref.listing_type), key=_PRIORITY.__getitem__)
+                version = max(old.version or 0, ref.version or 0) or None
+                ref = ListingRef(ref.arxiv_id, version, kind)
+            refs[ref.arxiv_id] = ref
+            dates_by_id[ref.arxiv_id] = announced
+
+        pages, failed = self._pages("new", parse_listing)
         for category in self.categories:
-            try:
-                page = self._get(f"https://arxiv.org/list/{category}/new", {"show": 2000},
-                                 lambda response: parse_listing(response.text))
-                if day is not None and day != page.announced:
-                    raise SourceError("requested date does not match the current arXiv announcement")
-            except Exception:
-                errors.append(SourceFailure(source="arxiv_listing", stage="listing", category=category,
-                                            announced=day, message="arXiv listing fetch or validation failed"))
+            page = pages.get(category)
+            if page is not None and day is not None and day != page.announced:
+                failed[category] = SourceError("requested date does not match the current arXiv announcement")
+                page = None
+            if page is None:
+                errors.append(SourceFailure(
+                    source="arxiv_listing", stage="listing", category=category, announced=day,
+                    message=f"arXiv listing fetch or validation failed ({failure_reason(failed[category])})"))
                 continue
             announcement_dates.add(page.announced)
             for ref in page.entries:
-                old = refs.get(ref.arxiv_id)
-                if old and page.announced < dates_by_id[ref.arxiv_id]:
+                add(ref, page.announced)
+        if self.catch_up and day is None:
+            # An explicit date is a manual check of one announcement; only the
+            # default run recovers earlier days.
+            current = set(refs)
+            past, past_failed = self._pages("pastweek", parse_pastweek)
+            for category in self.categories:
+                if category in past_failed:
+                    errors.append(SourceFailure(
+                        source="arxiv_listing", stage="listing", category=category,
+                        message=f"arXiv past-week listing fetch or validation failed ({failure_reason(past_failed[category])})"))
                     continue
-                if old and page.announced == dates_by_id[ref.arxiv_id]:
-                    kind = min((old.listing_type, ref.listing_type), key=_PRIORITY.__getitem__)
-                    version = max(old.version or 0, ref.version or 0) or None
-                    ref = ListingRef(ref.arxiv_id, version, kind)
-                refs[ref.arxiv_id] = ref
-                dates_by_id[ref.arxiv_id] = page.announced
+                for announced, entries in sorted(past[category].items()):
+                    missing = [ref for ref in entries if ref.arxiv_id not in self.known_ids and ref.arxiv_id not in current]
+                    for ref in missing:
+                        add(ref, announced)
+                    if missing:
+                        announcement_dates.add(announced)
         result = []
         for announced in sorted(announcement_dates):
             identifiers = sorted(key for key in refs if dates_by_id[key] == announced)
