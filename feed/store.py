@@ -17,7 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from feed.schema import Paper, title_match_key
+from feed.schema import Paper, canonical_doi, title_match_key
 from feed.errors import ScholarIssue, SourceFailure
 
 
@@ -62,6 +62,8 @@ def merge_papers(existing: Paper, incoming: Paper) -> Paper:
     """
     for field in ("arxiv_id", "doi"):
         left, right = getattr(existing, field), getattr(incoming, field)
+        if field == "doi" and left and right:
+            left, right = canonical_doi(left), canonical_doi(right)
         if left and right and left != right:
             raise IdentifierConflict(field)
     data = existing.model_dump()
@@ -80,6 +82,10 @@ def merge_papers(existing: Paper, incoming: Paper) -> Paper:
     data["links"] = {**incoming.links, **existing.links}
     if prefer_incoming:
         data["links"].update(incoming.links)
+    if data.get("doi") and existing.doi and incoming.doi and existing.doi != incoming.doi:
+        # Two spellings of one DOI (publisher page suffix): keep the clean one.
+        data["doi"] = canonical_doi(data["doi"])
+        data["links"]["doi"] = "https://doi.org/" + data["doi"]
     data["paper_id"] = ""
     merged = Paper.model_validate(data)
     if merged == existing:
@@ -102,7 +108,7 @@ class _PaperIndex:
 
     def add(self, paper: Paper) -> None:
         if paper.doi:
-            self.by_doi[paper.doi].add(paper.paper_id)
+            self.by_doi[canonical_doi(paper.doi)].add(paper.paper_id)
         title = title_match_key(paper.title)
         self.by_title[title].add(paper.paper_id)
         self.title_keys[paper.paper_id] = title
@@ -111,10 +117,11 @@ class _PaperIndex:
 
     def remove(self, paper: Paper) -> None:
         if paper.doi:
-            bucket = self.by_doi[paper.doi]
+            key = canonical_doi(paper.doi)
+            bucket = self.by_doi[key]
             bucket.remove(paper.paper_id)
             if not bucket:
-                del self.by_doi[paper.doi]
+                del self.by_doi[key]
         if paper.paper_id in self.title_keys:
             title = self.title_keys.pop(paper.paper_id)
             bucket = self.by_title[title]
@@ -130,7 +137,7 @@ class _PaperIndex:
     def matches(self, paper: Paper) -> set[str]:
         matched = {paper.paper_id} if paper.paper_id in self.papers else set()
         if paper.doi:
-            matched.update(self.by_doi.get(paper.doi, ()))
+            matched.update(self.by_doi.get(canonical_doi(paper.doi), ()))
         titles = self.by_title if paper.paper_id.startswith("title:") else self.unresolved_by_title
         if titles:
             matched.update(titles.get(title_match_key(paper.title), ()))

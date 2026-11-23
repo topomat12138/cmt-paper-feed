@@ -379,3 +379,41 @@ def test_current_scholar_store_conflict_still_fails_without_overwriting_record(t
     assert cli.main(["scholar", "--data-dir", str(tmp_path), "--items-json", json.dumps(ITEMS[:1])]) == 1
     assert json.loads(capsys.readouterr().out)["error_counts"] == {"identifier_conflict": 1}
     assert store.load() == {existing.paper_id: existing}
+
+
+def test_one_unresolved_item_among_several_keeps_the_run_green(tmp_path, runtime, capsys):
+    _, handler, calls = runtime
+    lost = {"title": "Synthetic title that no service can resolve"}
+
+    def reply(request):
+        if request.url.host == "export.arxiv.org" and "search_query" in request.url.params:
+            return httpx.Response(503)
+        if request.url.host == "api.openalex.org" and "filter" in request.url.params:
+            return httpx.Response(503)
+        return respond(request)
+
+    handler["reply"] = reply
+    assert cli.main(["scholar", "--data-dir", str(tmp_path), "--items-json", json.dumps([*ITEMS, lost])]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["failed"] == 1 and report["new"] == 3
+    daily = DailyManifest.model_validate_json((tmp_path / "daily/2026-10-31.json").read_bytes())
+    messages = [error.message for error in daily.errors if error.code == "resolution_failure"]
+    assert any("(OpenAlex request failed after three attempts)" in message for message in messages)
+
+
+def test_transient_failure_is_retried_once_in_the_same_run(tmp_path, runtime, capsys):
+    _, handler, calls = runtime
+    state = {"openalex": 0}
+
+    def reply(request):
+        if request.url.host == "api.openalex.org":
+            state["openalex"] += 1
+            if state["openalex"] <= 3:
+                return httpx.Response(503)
+        return respond(request)
+
+    handler["reply"] = reply
+    assert cli.main(["scholar", "--data-dir", str(tmp_path), "--items-json", json.dumps(ITEMS)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["failed"] == 0 and report["error_counts"] == {}
+    assert set(PaperStore(tmp_path).load()) == {f"arxiv:{ARXIV}", "doi:" + DOI}

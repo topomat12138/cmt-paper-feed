@@ -19,7 +19,7 @@ from urllib.parse import quote, unquote, urlsplit
 import httpx
 
 from feed.errors import ScholarIssue
-from feed.schema import Paper, normalize_title, title_match_key
+from feed.schema import Paper, canonical_doi, normalize_title, title_match_key
 from feed.sources.arxiv_listing import (
     API_URL, NS, USER_AGENT, ArxivListing, IncompleteMetadataError,
     ListingRef, _identifier, parse_metadata,
@@ -100,7 +100,8 @@ def extract_doi(url: str | None) -> str | None:
         doi = match[1].rstrip("/")
         while _DOI_TAIL.search(doi):
             doi = _DOI_TAIL.sub("", doi)
-        return doi.lower() if re.fullmatch(r"10\.\d{4,9}/\S+", doi) else None
+        doi = canonical_doi(doi)
+        return doi if re.fullmatch(r"10\.\d{4,9}/\S+", doi) else None
     except ValueError:
         return None
 
@@ -481,9 +482,13 @@ class Resolver:
                         routes[index] = "openalex_title"
                         continue
                 fallback(index, item)
-            except Exception:
-                issue(index, "resolve", "paper metadata resolution failed; retained the known DOI" if known_doi
-                      else "paper resolution failed; retained the public title only")
+            except Exception as error:
+                # SourceError messages are fixed strings from this package; for
+                # anything else only the class name is reported, never its text.
+                reason = str(error) if isinstance(error, SourceError) else type(error).__name__
+                issue(index, "resolve", ("paper metadata resolution failed; retained the known DOI" if known_doi
+                                         else "paper resolution failed; retained the public title only")
+                      + f" ({reason})")
                 fallback(index, item, known_doi, known_route)
 
         by_id = {}

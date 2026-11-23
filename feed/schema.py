@@ -39,6 +39,28 @@ def title_match_key(title: str) -> str:
     return "".join(normalize_title(title).split())
 
 
+def canonical_doi(doi: str) -> str:
+    """Drop publisher page segments that some article URLs append to a DOI.
+
+    Seen in Scholar links: IOP ``.../meta``, ACS ``10.1021/<id>/<number>``,
+    OUP ``10.1093/<journal>/<id>/<number>/<id>``. ACS DOIs never contain a
+    slash after the prefix and OUP journal DOIs have exactly two segments, so
+    trimming them is safe; every other DOI is returned unchanged (lowercased).
+    Stored records keep the DOI they were written with; this is used for
+    extraction and for matching, so a later corrected sighting merges.
+    """
+    doi = doi.strip().lower().rstrip("/")
+    prefix, _, suffix = doi.partition("/")
+    parts = suffix.split("/")
+    if prefix == "10.1088" and len(parts) > 2 and parts[-1] == "meta":
+        parts = parts[:-1]
+    elif prefix == "10.1021" and len(parts) > 1:
+        parts = parts[:1]
+    elif prefix == "10.1093" and len(parts) > 2:
+        parts = parts[:2]
+    return prefix + "/" + "/".join(parts) if suffix else doi
+
+
 def make_paper_id(*, arxiv_id: str | None, doi: str | None, title: str) -> str:
     """Build an ID from canonical identifiers, in arXiv/DOI/title order."""
     if arxiv_id:
