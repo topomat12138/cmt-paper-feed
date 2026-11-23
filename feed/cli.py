@@ -95,7 +95,13 @@ def _scholar(args) -> int:
     if result.errors:
         print(f"scholar completed with {len(result.errors)} diagnostics; resolved records were stored",
               file=sys.stderr)
-    return int(source.stats["failed"] > 0 or any(error.code != "resolution_failure" for error in result.errors))
+    # A few unresolved items stay as title/DOI-only records with diagnostics in
+    # the daily file and do not fail the run (a later sighting upgrades them).
+    # Fail only when every item failed (likely an API outage) or on payload,
+    # storage and identifier problems.
+    items = source.stats["valid"] - source.stats["deduplicated"]
+    outage = source.stats["failed"] > 0 and source.stats["failed"] >= items
+    return int(outage or any(error.code != "resolution_failure" for error in result.errors))
 
 
 def main(argv: list[str] | None = None) -> int:

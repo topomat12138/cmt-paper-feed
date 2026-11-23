@@ -483,3 +483,31 @@ def test_manifest_date_mismatch_fails_before_writes(tmp_path, paper):
     with pytest.raises(ValueError, match="date does not match"):
         store.upsert([paper()], day=DAY)
     assert snapshot(tmp_path) == before
+
+
+def test_publisher_suffix_doi_record_merges_into_corrected_sighting(tmp_path, paper, monkeypatch):
+    store = PaperStore(tmp_path)
+    # Recreate records stored before DOI spellings were compared canonically.
+    monkeypatch.setattr(store_module, "canonical_doi", lambda doi: doi)
+    junk = Paper(title="Synthetic IOP paper", doi="10.1088/1361-648x/aec34c/meta",
+                 links={"doi": "https://doi.org/10.1088/1361-648x/aec34c/meta"},
+                 sources=["scholar_alert"], first_seen="2026-10-28T00:33:00Z")
+    oup = Paper(title="Synthetic OUP paper", doi="10.1093/pnasnexus/pgag389/73656548/pgag389",
+                sources=["scholar_alert"], first_seen="2026-10-28T00:33:00Z")
+    arxiv = paper(arxiv_id="2610.20001", title="Synthetic OUP paper", doi="10.1093/pnasnexus/pgag389")
+    store.upsert([junk, oup, arxiv], day=DAY)
+    assert len(store.load()) == 3
+    monkeypatch.undo()
+    fixed = Paper(title="Synthetic IOP paper", doi="10.1088/1361-648X/aec34c", authors=["A. Author"],
+                  sources=["scholar_alert"], first_seen=LATER)
+    again = Paper(title="Synthetic OUP paper", doi="10.1093/pnasnexus/pgag389",
+                  sources=["scholar_alert"], first_seen=LATER)
+    result = store.upsert([fixed, again], day=NEXT)
+    papers = store.load()
+    assert set(papers) == {"doi:10.1088/1361-648x/aec34c", "arxiv:2610.20001"}
+    iop = papers["doi:10.1088/1361-648x/aec34c"]
+    assert iop.authors == ["A. Author"] and iop.links["doi"] == "https://doi.org/10.1088/1361-648x/aec34c"
+    assert str(iop.first_seen).startswith("2026-10-28")
+    merged = papers["arxiv:2610.20001"]
+    assert merged.doi == "10.1093/pnasnexus/pgag389" and "scholar_alert" in merged.sources
+    assert result.errors == []

@@ -20,6 +20,9 @@ from feed.schema import Paper, title_match_key
 from feed.sources.base import Source, SourceResult, register
 
 _RESOLUTION_KINDS = ("arxiv_url", "doi_url", "arxiv_title", "openalex_title", "title_only", "doi_title_link")
+# One pause before re-resolving a payload whose first pass hit remote errors.
+# Earlier red runs (one item each) all succeeded on a plain re-run.
+RETRY_DELAY = 60.0
 _GOOGLE_HOST = re.compile(r"(?:scholar\.)?google\.[a-z0-9]+(?:\.[a-z0-9-]+)*", re.IGNORECASE)
 
 
@@ -45,12 +48,17 @@ def _public_url(value: object) -> str | None:
     return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", ""))
 
 
+def _failures(result) -> int:
+    return sum(error.code == "resolution_failure" for error in result.errors)
+
+
 @register("scholar_alert")
 class ScholarAlert(Source):
     def __init__(self, *, payload: object, client: httpx.Client, resolver=None,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic):
         self.payload = payload
+        self.sleep = sleep
         if resolver is None:
             # Keep source registration independent from the resolver's arXiv
             # imports, so either module can be imported first.
@@ -118,6 +126,13 @@ class ScholarAlert(Source):
             return SourceResult(dates, [], errors)
         try:
             result = self.resolver.resolve(items, seen_at=observed)
+            if _failures(result):
+                # Remote lookups fail transiently; try the whole payload once
+                # more and keep whichever pass recovered more items.
+                self.sleep(RETRY_DELAY)
+                retry = self.resolver.resolve(items, seen_at=observed)
+                if _failures(retry) <= _failures(result):
+                    result = retry
         except Exception:
             # Resolver implementations isolate ordinary remote failures. Keep a
             # defensive title-only result if an unexpected backend error escapes.

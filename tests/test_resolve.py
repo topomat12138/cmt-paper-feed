@@ -113,6 +113,14 @@ def test_arxiv_url_variants(url, expected):
     ("https://example.org/article/10.1234%2Fdemo/abstract", "10.1234/demo"),
     ("https://www.sciencedirect.com/science/article/pii/S0577907326003874", None),
     ("https://example.org/article?doi=10.1234/not-from-path", None),
+    # Publisher page segments seen in real Scholar links (2026-11).
+    ("https://iopscience.iop.org/article/10.1088/1361-648X/aec34c/meta", "10.1088/1361-648x/aec34c"),
+    ("https://pubs.acs.org/doi/10.1021/acs.nanolett.6c04819/5472157", "10.1021/acs.nanolett.6c04819"),
+    ("https://academic.oup.com/nsr/article/doi/10.1093/nsr/nwag695/73037055/nwag695", "10.1093/nsr/nwag695"),
+    # Multi-segment DOIs that are real stay intact.
+    ("https://doi.org/10.1088/0256-307X/43/12/120708", "10.1088/0256-307x/43/12/120708"),
+    ("https://doi.org/10.21203/rs.3.rs-11232671/v1", "10.21203/rs.3.rs-11232671/v1"),
+    ("https://doi.org/10.1140/epjp/s13360-026-08540-5", "10.1140/epjp/s13360-026-08540-5"),
 ])
 def test_publisher_url_doi_extraction(url, expected):
     assert extract_doi(url) == expected
